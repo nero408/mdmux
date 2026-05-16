@@ -1,0 +1,39 @@
+[package]
+name = "mdmux"
+version = "0.1.0"
+edition = "2024"
+description = "A terminal UI for browsing markdown files and rendering them in a cmux split"
+authors = ["nero408 <12416716+nero408@users.noreply.github.com>"]
+license = "MIT"
+repository = "https://github.com/nero408/mdmux"
+homepage = "https://github.com/nero408/mdmux"
+readme = "README.md"
+keywords = ["tui", "markdown", "cmux", "terminal", "viewer"]
+categories = ["command-line-utilities", "text-processing"]
+
+[lib]
+name = "mdmux"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mdmux"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+ignore = "0.4"
+clap = { version = "4.5", features = ["derive", "env"] }
+anyhow = "1.0"
+thiserror = "2.0"
+unicode-width = "0.2"
+dirs = "5.0"
+
+[features]
+default = []
+test-support = []
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+codegen-units = 1

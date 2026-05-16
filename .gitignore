@@ -1,0 +1,18 @@
+# Rust build artifacts
+/target
+
+# IDE / editor scratch
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# OS / shell
+*.log
+.env
+.env.*
+!.env.example
