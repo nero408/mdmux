@@ -150,8 +150,10 @@ pub fn parse_open_output(s: &str) -> Result<OpenResult, CmuxError> {
     })
 }
 
-/// In-memory mock for tests.
-#[cfg(any(test, feature = "test-support"))]
+/// In-memory mock used by tests and by the `--demo` flag.
+///
+/// Compiled into the release binary unconditionally so screenshots and gifs
+/// can be produced on machines that don't have cmux installed (e.g. CI).
 pub mod mock {
     use super::*;
     use std::cell::RefCell;

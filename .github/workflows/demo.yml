@@ -1,0 +1,88 @@
+name: demo gif
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "assets/demo.tape"
+      - ".github/workflows/demo.yml"
+  workflow_dispatch:
+
+# Only one regen at a time; cancel anything older still in flight.
+concurrency:
+  group: demo-gif
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  render:
+    name: render demo.gif
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # We need a real ref so the commit-back step can push.
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build mdmux (release)
+        run: cargo build --release
+
+      - name: Install mdmux on PATH
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          cp target/release/mdmux "$HOME/.local/bin/mdmux"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Sanity-check binary
+        run: |
+          mdmux --version
+          # `--list` exits cleanly without needing cmux; good smoke test.
+          mkdir -p /tmp/sanity && echo "# hi" > /tmp/sanity/a.md
+          mdmux --list /tmp/sanity
+
+      - name: Install vhs
+        uses: charmbracelet/vhs-action@v2
+
+      - name: Render demo.gif
+        run: |
+          vhs assets/demo.tape
+          ls -la assets/demo.gif
+          # Bail loudly if the gif came out empty / suspiciously small.
+          size=$(stat -c%s assets/demo.gif)
+          echo "demo.gif is ${size} bytes"
+          if [ "$size" -lt 20000 ]; then
+            echo "::error::demo.gif is suspiciously small (<20kB) — vhs likely failed silently"
+            exit 1
+          fi
+
+      - name: Upload artifact (always, for debugging)
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-gif
+          path: assets/demo.gif
+          if-no-files-found: error
+
+      - name: Commit regenerated gif
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          # `[skip ci]` prevents the commit-back from re-triggering CI, and
+          # the `paths:` filter above already excludes assets/demo.gif anyway
+          # — belt + suspenders.
+          commit_message: "chore(demo): regenerate demo.gif [skip ci]"
+          file_pattern: assets/demo.gif
+          commit_user_name: github-actions[bot]
+          commit_user_email: 41898282+github-actions[bot]@users.noreply.github.com
+          commit_author: "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"

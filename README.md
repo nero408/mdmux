@@ -1,11 +1,16 @@
 # mdmux
 
 [![CI](https://github.com/nero408/mdmux/actions/workflows/ci.yml/badge.svg)](https://github.com/nero408/mdmux/actions/workflows/ci.yml)
+[![demo gif](https://github.com/nero408/mdmux/actions/workflows/demo.yml/badge.svg)](https://github.com/nero408/mdmux/actions/workflows/demo.yml)
 [![Crates.io](https://img.shields.io/crates/v/mdmux.svg)](https://crates.io/crates/mdmux)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A terminal UI for browsing markdown files in a directory tree and rendering
 the selected file in a [cmux](https://cmux.app) side-panel with live reload.
+
+<p align="center">
+  <img src="assets/demo.gif" alt="mdmux demo — file tree on the left, cmux markdown panel on the right" width="900">
+</p>
 
 ```
  mdmux  /home/me/notes
@@ -62,6 +67,7 @@ mdmux --hidden         # include dotfiles
 mdmux --no-gitignore   # show ignored markdown files too
 mdmux --max-depth 3    # cap recursion
 mdmux --list           # print markdown paths and exit (scripting)
+mdmux --demo           # run with a fake cmux client (screenshots / gifs / CI)
 ```
 
 Run it inside a cmux pane. Pressing **Enter** on a markdown file splits the
@@ -134,6 +140,21 @@ cargo test
 Bug reports and PRs welcome — open an issue first for anything bigger than
 a typo so we can talk it through. `cargo test` should stay green; new
 behavior gets a unit test against the `CmuxClient` trait.
+
+### Regenerating the demo gif
+
+`assets/demo.gif` is rendered by [vhs](https://github.com/charmbracelet/vhs)
+from `assets/demo.tape`. CI regenerates it automatically on every push that
+touches `src/**` or the tape itself. To regenerate locally:
+
+```sh
+cargo install --path .            # put mdmux on PATH
+brew install vhs                  # or see vhs install docs
+vhs assets/demo.tape              # writes assets/demo.gif
+```
+
+The tape uses `mdmux --demo`, which substitutes a built-in fake cmux client
+so the gif can be produced on machines without cmux installed.
 
 ## License
 

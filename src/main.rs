@@ -21,7 +21,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use mdmux::app::{Action, App, Mode};
-use mdmux::cmux::{CliCmux, CmuxClient};
+use mdmux::cmux::{CliCmux, CmuxClient, mock::MockCmux};
 use mdmux::tree::NodeKind;
 use mdmux::ui::draw;
 
@@ -59,6 +59,12 @@ struct Cli {
     /// Override the cmux binary (useful for tests).
     #[arg(long, env = "CMUX_BIN")]
     cmux_bin: Option<String>,
+
+    /// Run with a built-in fake cmux client. cmux calls are no-ops; the TUI
+    /// reports a fake `surface:N` in the status line. Used for screenshots,
+    /// gifs, and CI smoke tests on machines without cmux installed.
+    #[arg(long)]
+    demo: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -72,9 +78,13 @@ fn main() -> anyhow::Result<()> {
         return list_files(root, &cli);
     }
 
-    let cmux: Box<dyn CmuxClient> = Box::new(CliCmux {
-        binary: cli.cmux_bin.clone(),
-    });
+    let cmux: Box<dyn CmuxClient> = if cli.demo {
+        Box::new(MockCmux::new())
+    } else {
+        Box::new(CliCmux {
+            binary: cli.cmux_bin.clone(),
+        })
+    };
     let cmux_available = cmux.is_available();
 
     let mut app = App::new(root, cmux)?;
