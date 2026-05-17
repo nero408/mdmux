@@ -68,11 +68,14 @@ jobs:
       - name: Install vhs
         env:
           VHS_VERSION: "0.11.0"
+        # Use `apt-get install <path>` so apt pulls in the .deb's declared
+        # dependencies. `dpkg -i` alone leaves them unconfigured.
         run: |
           set -euxo pipefail
           curl -fsSL -o /tmp/vhs.deb \
             "https://github.com/charmbracelet/vhs/releases/download/v${VHS_VERSION}/vhs_${VHS_VERSION}_amd64.deb"
-          sudo dpkg -i /tmp/vhs.deb
+          sudo apt-get update
+          sudo apt-get install -y /tmp/vhs.deb
           vhs --version
           ffmpeg -version | head -1
 
