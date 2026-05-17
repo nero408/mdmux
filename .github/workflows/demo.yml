@@ -40,10 +40,10 @@ jobs:
         run: cargo build --release
 
       - name: Install mdmux on PATH
+        # /usr/local/bin is universally on PATH (incl. inside the ttyd shell
+        # that vhs spawns); avoids relying on ~/.profile or $GITHUB_PATH.
         run: |
-          mkdir -p "$HOME/.local/bin"
-          cp target/release/mdmux "$HOME/.local/bin/mdmux"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          sudo install -m 0755 target/release/mdmux /usr/local/bin/mdmux
 
       - name: Sanity-check binary
         run: |
@@ -52,8 +52,29 @@ jobs:
           mkdir -p /tmp/sanity && echo "# hi" > /tmp/sanity/a.md
           mdmux --list /tmp/sanity
 
+      # We install vhs + ttyd by hand. `charmbracelet/vhs-action@v2` pins
+      # ffmpeg to BtbN's n5.1 release pattern, which no longer exists
+      # (BtbN ships ffmpeg-master-latest-* now), so the action fails with
+      # "Failed to install ffmpeg". ffmpeg is already on ubuntu-latest, so
+      # we just need vhs (.deb) and ttyd (static binary).
+      - name: Install ttyd
+        run: |
+          set -euxo pipefail
+          sudo curl -fsSL -o /usr/local/bin/ttyd \
+            https://github.com/tsl0922/ttyd/releases/latest/download/ttyd.x86_64
+          sudo chmod +x /usr/local/bin/ttyd
+          ttyd --version
+
       - name: Install vhs
-        uses: charmbracelet/vhs-action@v2
+        env:
+          VHS_VERSION: "0.11.0"
+        run: |
+          set -euxo pipefail
+          curl -fsSL -o /tmp/vhs.deb \
+            "https://github.com/charmbracelet/vhs/releases/download/v${VHS_VERSION}/vhs_${VHS_VERSION}_amd64.deb"
+          sudo dpkg -i /tmp/vhs.deb
+          vhs --version
+          ffmpeg -version | head -1
 
       - name: Render demo.gif
         run: |

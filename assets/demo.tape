@@ -9,7 +9,7 @@
 
 Output assets/demo.gif
 
-Set Shell zsh
+Set Shell bash
 Set FontSize 14
 Set Width 1100
 Set Height 620
