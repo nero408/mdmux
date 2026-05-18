@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Entries are generated from [conventional commits](https://www.conventionalcommits.org)
 by [git-cliff](https://git-cliff.org).
 
-## [Unreleased]
+## [0.1.1](https://github.com/nero408/mdmux/commit/v0.1.1) - 2026-05-18
 
 ### Bug Fixes
 
@@ -15,6 +15,7 @@ by [git-cliff](https://git-cliff.org).
 
 ### Chores
 
+- Automate releases with cargo-release + git-cliff (#3) ([cbdbb89](https://github.com/nero408/mdmux/commit/cbdbb8972781fc55f73693f8f8b1b482bf9764be))
 - Launch-hardening pass (security, robustness, UX) (#1) ([caf346f](https://github.com/nero408/mdmux/commit/caf346f885c7da3ca4593c7d18e5630295a0a137))
 
 ### Features
