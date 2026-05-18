@@ -1,0 +1,69 @@
+# cargo-release configuration.
+#
+# Bumps Cargo.toml, regenerates CHANGELOG.md from conventional commits via
+# git-cliff, commits, tags, pushes, and publishes to crates.io. The existing
+# GitHub Actions release workflow keys off the pushed `v*` tag to build
+# binaries and bump the Homebrew tap.
+#
+# Usage:
+#   cargo release patch --execute      # 0.1.0 → 0.1.1
+#   cargo release minor --execute      # 0.1.0 → 0.2.0
+#   cargo release major --execute      # 0.1.0 → 1.0.0
+#   cargo release 0.3.0 --execute      # explicit version
+#
+# Drop `--execute` to dry-run; cargo-release defaults to a safe no-op so a
+# bare `cargo release patch` only prints what *would* happen.
+
+# Releases happen from main. cargo-release refuses to publish from any other
+# branch by default, which is what we want — a release tag should always
+# point at a known-green main commit.
+allow-branch = ["main"]
+
+# Tag the commit `vX.Y.Z` to match what the release workflow listens for
+# (`on: push: tags: ["v*"]`). This is also the cargo-release default but
+# stated explicitly to avoid surprises.
+tag-prefix = ""
+tag-name = "v{{version}}"
+tag-message = "mdmux {{version}}"
+
+# Commit message for the version bump. Conventional-commits compatible so
+# git-cliff groups it under "chore" rather than dropping it.
+pre-release-commit-message = "chore(release): mdmux {{version}}"
+
+# Push the bump commit + tag to origin. CI ("release" workflow) keys off the
+# tag and does the rest (build binaries, attach to GitHub Release, bump
+# Homebrew tap).
+push = true
+push-remote = "origin"
+
+# Publish to crates.io. Requires `cargo login` to have been run once with a
+# valid token (or CARGO_REGISTRY_TOKEN set in the shell). Set to false if
+# you'd rather keep crates.io publishing manual.
+publish = true
+
+# Don't sign tags by default. The release workflow doesn't verify
+# signatures; if you want signed tags, set `sign-tag = true` in your
+# `~/.cargo/release.toml`.
+sign-tag = false
+sign-commit = false
+
+# Verify the workspace builds cleanly before bumping. This is the default
+# but called out so it doesn't get accidentally turned off.
+verify = true
+
+# Pre-release replacements — run before the bump commit is made. We use a
+# pre-release-hook (below) for the heavy lifting (regenerating the
+# changelog via git-cliff) so the replacements file stays empty.
+pre-release-replacements = []
+
+# Run `git cliff` to regenerate CHANGELOG.md with everything that landed
+# between the previous tag and HEAD, labelled with the new version.
+#
+# {{version}} is substituted by cargo-release before the hook runs, so
+# git-cliff sees the final tag string. `--prepend` writes to the top of
+# the file rather than overwriting history.
+pre-release-hook = [
+  "sh",
+  "-c",
+  "git cliff --tag v{{version}} --output CHANGELOG.md",
+]
