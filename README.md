@@ -1,4 +1,4 @@
-# mdmux
+# mdmux — Markdown Multiplexer
 
 [![CI](https://github.com/nero408/mdmux/actions/workflows/ci.yml/badge.svg)](https://github.com/nero408/mdmux/actions/workflows/ci.yml)
 [![demo gif](https://github.com/nero408/mdmux/actions/workflows/demo.yml/badge.svg)](https://github.com/nero408/mdmux/actions/workflows/demo.yml)
