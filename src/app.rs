@@ -25,6 +25,16 @@ pub enum Mode {
     Error { message: String },
 }
 
+/// Snapshot of a file loaded for the in-process demo preview pane.
+///
+/// Only populated when [`App::demo_mode`] is true. In normal use, the right
+/// pane is rendered by cmux itself, outside mdmux.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DemoPreview {
+    pub path: PathBuf,
+    pub lines: Vec<String>,
+}
+
 /// Result of handling a key — what the event loop should do next.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -52,6 +62,12 @@ pub struct App {
     pub auto_open: bool,
     /// Status line message shown briefly after an action.
     pub status: String,
+    /// When true, the TUI grows an in-process preview pane (see
+    /// [`DemoPreview`]) on file open. Used for `--demo` (screenshots / gifs);
+    /// the real binary delegates rendering to cmux.
+    pub demo_mode: bool,
+    /// Content of the most recently opened file when [`Self::demo_mode`] is on.
+    pub demo_preview: Option<DemoPreview>,
 }
 
 impl App {
@@ -71,6 +87,8 @@ impl App {
             cmux,
             auto_open: false,
             status: String::new(),
+            demo_mode: false,
+            demo_preview: None,
         })
     }
 
@@ -293,6 +311,16 @@ impl App {
         let res = self.cmux.open_markdown(&row.path)?;
         self.current_md_surface = Some(res.surface);
         self.last_opened = Some(row.path.clone());
+        if self.demo_mode {
+            // Best-effort: if the file can't be read we just leave the prior
+            // preview in place rather than failing the open.
+            if let Ok(content) = std::fs::read_to_string(&row.path) {
+                self.demo_preview = Some(DemoPreview {
+                    path: row.path.clone(),
+                    lines: content.lines().map(str::to_string).collect(),
+                });
+            }
+        }
         self.status = format!("→ {}", row.path.display());
         Ok(())
     }
@@ -302,6 +330,7 @@ impl App {
         if let Some(s) = self.current_md_surface.take() {
             let _ = self.cmux.close_surface(&s);
         }
+        self.demo_preview = None;
     }
 
     pub fn enter_help(&mut self) {

@@ -91,6 +91,7 @@ fn main() -> anyhow::Result<()> {
     app.config.show_hidden = cli.hidden;
     app.config.respect_gitignore = !cli.no_gitignore;
     app.config.max_depth = cli.max_depth;
+    app.demo_mode = cli.demo;
     app.refresh()?;
     if !cmux_available {
         app.mode = Mode::Error {

@@ -9,8 +9,12 @@ A terminal UI for browsing markdown files in a directory tree and rendering
 the selected file in a [cmux](https://cmux.app) side-panel with live reload.
 
 <p align="center">
-  <img src="assets/demo.gif" alt="mdmux demo — file tree on the left, cmux markdown panel on the right" width="900">
+  <img src="assets/demo.gif" alt="mdmux demo — file tree on the left, rendered markdown on the right" width="900">
 </p>
+
+> The gif is recorded with `mdmux --demo`, which renders an in-process
+> preview pane so the demo works on machines without cmux. In normal use
+> the right pane is cmux's own native renderer (with full live-reload).
 
 ```
  mdmux  /home/me/notes

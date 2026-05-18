@@ -5,30 +5,26 @@
 #   - `mdmux` on PATH (e.g. `cargo install --path .` first)
 #   - `vhs` (https://github.com/charmbracelet/vhs)
 #
-# CI regenerates this on every push that touches the tape or src/.
+# Uses --demo, which substitutes a built-in fake cmux client AND grows an
+# in-process preview pane so the gif can show "what cmux would render"
+# without cmux installed. CI uses this on every push that touches src/ or
+# the tape.
 
 Output assets/demo.gif
 
 Set Shell bash
 Set FontSize 14
-Set Width 1100
-Set Height 620
+Set Width 1200
+Set Height 680
 Set Theme "Catppuccin Mocha"
-Set TypingSpeed 70ms
+Set TypingSpeed 60ms
 Set PlaybackSpeed 1.0
 Set Padding 18
 
-# Build a deterministic notes tree off-screen so the gif is reproducible.
+# Seed the fake notes tree off-screen so the gif is reproducible.
 Hide
-Type "rm -rf /tmp/mdmux-demo && mkdir -p /tmp/mdmux-demo/docs/api /tmp/mdmux-demo/notes" Enter
+Type "bash assets/seed_demo.sh" Enter
 Type "cd /tmp/mdmux-demo" Enter
-Type "printf '# mdmux\n\nA terminal markdown browser.\n' > README.md" Enter
-Type "printf '# Getting started\n' > docs/getting-started.md" Enter
-Type "printf '# Endpoints\n' > docs/api/endpoints.md" Enter
-Type "printf '# Errors\n' > docs/api/errors.md" Enter
-Type "printf '# Webhooks\n' > docs/api/webhooks.md" Enter
-Type "printf '# Design notes — 2026-05-13\n' > notes/2026-05-13-design.md" Enter
-Type "printf '# Random thoughts\n' > notes/random.md" Enter
 Type "clear" Enter
 Show
 
@@ -36,28 +32,35 @@ Show
 Type "mdmux --demo ."
 Sleep 400ms
 Enter
-Sleep 1600ms
+Sleep 1800ms
 
-# Walk down into docs/api/, open a file.
-Down Sleep 300ms
-Right Sleep 350ms          # expand docs/
-Down Sleep 250ms
-Right Sleep 350ms          # expand docs/api/
-Down Sleep 250ms
-Enter Sleep 1600ms         # open endpoints.md
+# Open the top-level README so the preview pane appears.
+Enter Sleep 2400ms
 
-# Hop to another file — panel is replaced, not stacked.
+# Walk into docs/api/, open endpoints.md.
+Down Sleep 250ms                 # docs/
+Right Sleep 350ms                # expand docs/
+Down Sleep 250ms                 # docs/api/
+Right Sleep 350ms                # expand docs/api/
+Down Sleep 250ms                 # endpoints.md
+Enter Sleep 2400ms
+
+# Replace, don't stack — open errors.md next.
 Down Sleep 350ms
-Enter Sleep 1600ms         # open errors.md
+Enter Sleep 2400ms
 
-# Show the live filter.
+# And webhooks.md.
+Down Sleep 350ms
+Enter Sleep 2400ms
+
+# Live filter.
 Type "/" Sleep 400ms
-Type "des" Sleep 1200ms
+Type "des" Sleep 1400ms
 Escape Sleep 500ms
 
-# Peek at the help screen.
-Type "?" Sleep 1600ms
+# Peek at help.
+Type "?" Sleep 1800ms
 Escape Sleep 500ms
 
 # Quit.
-Type "q" Sleep 500ms
+Type "q" Sleep 600ms

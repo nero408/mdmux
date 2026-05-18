@@ -10,7 +10,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
-use crate::app::{App, Mode};
+use crate::app::{App, DemoPreview, Mode};
 use crate::tree::NodeKind;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -19,7 +19,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // title bar
-            Constraint::Min(1),    // tree
+            Constraint::Min(1),    // body (tree, or tree + preview in demo)
             Constraint::Length(1), // status / filter
             Constraint::Length(1), // hint
         ])
@@ -27,11 +27,26 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     draw_title(f, app, chunks[0]);
 
+    // In demo mode, once a file has been opened we split the body
+    // horizontally and render its content on the right. In real use, the
+    // right pane is owned by cmux.
+    let preview_snapshot = app.demo_preview.clone();
+    let tree_area = if let Some(ref preview) = preview_snapshot {
+        let body = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+            .split(chunks[1]);
+        draw_demo_preview(f, preview, body[1]);
+        body[0]
+    } else {
+        chunks[1]
+    };
+
     // Resize viewport based on actual tree height.
-    let tree_height = chunks[1].height.saturating_sub(2); // borders
+    let tree_height = tree_area.height.saturating_sub(2); // borders
     app.viewport_height = tree_height.max(1);
 
-    draw_tree(f, app, chunks[1]);
+    draw_tree(f, app, tree_area);
     draw_status(f, app, chunks[2]);
     draw_hint(f, app, chunks[3]);
 
@@ -396,3 +411,108 @@ const HELP_LINES: &[(&str, &str)] = &[
     ("q", "quit (closes cmux panel)"),
     ("Q", "quit (keep cmux panel open)"),
 ];
+
+fn draw_demo_preview(f: &mut Frame, preview: &DemoPreview, area: Rect) {
+    let filename = preview
+        .path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("?");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Line::from(vec![
+            Span::raw(" 📝 "),
+            Span::styled(
+                filename.to_string(),
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "  · live reload (demo)  ",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    let para = Paragraph::new(render_markdown_lines(&preview.lines))
+        .block(block)
+        .wrap(Wrap { trim: false });
+    f.render_widget(para, area);
+}
+
+/// Lightly-styled markdown → ratatui lines. Not a full parser — handles the
+/// constructs that make a 10-second demo gif look right (headings, fenced
+/// code blocks, list items, blockquotes, horizontal rules). Anything else
+/// passes through unchanged.
+fn render_markdown_lines(lines: &[String]) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(lines.len());
+    let mut in_code = false;
+    for raw in lines {
+        let line = raw.as_str();
+        if let Some(rest) = line.strip_prefix("```") {
+            in_code = !in_code;
+            let label = if in_code && !rest.is_empty() {
+                format!("  ─── {} ───", rest.trim())
+            } else {
+                "  ─────────".to_string()
+            };
+            out.push(Line::from(Span::styled(
+                label,
+                Style::default().fg(Color::DarkGray),
+            )));
+            continue;
+        }
+        if in_code {
+            out.push(Line::from(Span::styled(
+                format!("    {}", line),
+                Style::default().fg(Color::LightGreen),
+            )));
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("### ") {
+            out.push(Line::from(Span::styled(
+                format!("  {}", rest),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        } else if let Some(rest) = line.strip_prefix("## ") {
+            out.push(Line::from(Span::styled(
+                format!(" {}", rest),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        } else if let Some(rest) = line.strip_prefix("# ") {
+            out.push(Line::from(Span::styled(
+                rest.to_string(),
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            )));
+        } else if let Some(rest) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
+            out.push(Line::from(vec![
+                Span::styled("  • ", Style::default().fg(Color::Cyan)),
+                Span::raw(rest.to_string()),
+            ]));
+        } else if let Some(rest) = line.strip_prefix("> ") {
+            out.push(Line::from(vec![
+                Span::styled("┃ ", Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    rest.to_string(),
+                    Style::default()
+                        .fg(Color::Gray)
+                        .add_modifier(Modifier::ITALIC),
+                ),
+            ]));
+        } else if line.trim() == "---" || line.trim() == "***" {
+            out.push(Line::from(Span::styled(
+                "─".repeat(40),
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            out.push(Line::from(Span::raw(raw.clone())));
+        }
+    }
+    out
+}
