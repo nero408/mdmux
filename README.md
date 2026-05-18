@@ -110,8 +110,9 @@ emphasis), with live reload via [notify](https://crates.io/crates/notify).
 | `Enter` / `o`   | open selected markdown (cmux panel or in-process pane)  |
 | `a`             | toggle auto-open while navigating                       |
 | `x`             | close the open panel                                    |
-| `J` / `K`       | scroll preview down / up (in-process mode)              |
-| `Ctrl-D` / `Ctrl-U` | scroll preview half a page (in-process mode)        |
+| `j` / `k`       | scroll preview a full page down / up (in-process mode, preview open) |
+| `J` / `K`       | scroll preview half a page down / up (in-process mode)  |
+| `Ctrl-D` / `Ctrl-U` | scroll preview half a page (alt; in-process mode)   |
 | `c d`           | make selected directory the new root                    |
 | `u`             | move root up to parent directory                        |
 | `b`             | go back to the previous root (history)                  |
@@ -157,7 +158,9 @@ rendering the panel itself:
 3. A [notify](https://crates.io/crates/notify) watcher tracks the open
    file and reloads on disk changes — same live-reload experience as
    cmux, just rendered inside mdmux's own pane.
-4. `J` / `K` / `Ctrl-D` / `Ctrl-U` scroll the preview.
+4. `j` / `k` scroll the preview a full page; `J` / `K` (or `Ctrl-D` /
+   `Ctrl-U`) scroll half a page. With a preview open, `j` / `k` no
+   longer move the tree — use the arrow keys for that.
 
 Force this mode with `--no-cmux` if you'd rather not spawn external cmux
 panes even when cmux is available.
