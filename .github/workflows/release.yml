@@ -20,15 +20,23 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Both macOS targets cross-compile from macos-14 (Apple Silicon,
+          # rock-solid availability). macos-15 sometimes queues forever for
+          # accounts without explicit access, and Apple is winding down the
+          # Intel macos-13 runners — relying on either was flaky.
           - target: aarch64-apple-darwin
-            os: macos-15
+            os: macos-14
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-14
+          # 22.04 has a glibc old enough to run on most Linux desktops in
+          # the wild. Bump only when 22.04 reaches EOL.
           - target: x86_64-unknown-linux-gnu
-            # 22.04 has a glibc old enough to run on most Linux desktops in
-            # the wild. Bump only when 22.04 reaches EOL.
             os: ubuntu-22.04
     runs-on: ${{ matrix.os }}
+    env:
+      # Compiled binaries should run on every macOS still receiving updates.
+      # Only consumed by the macOS jobs; harmless on Linux.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
