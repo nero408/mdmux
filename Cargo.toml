@@ -1,6 +1,6 @@
 [package]
 name = "mdmux"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 description = "A terminal UI for browsing markdown files and rendering them in a cmux split"
 authors = ["nero408 <12416716+nero408@users.noreply.github.com>"]

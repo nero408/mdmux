@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Entries are generated from [conventional commits](https://www.conventionalcommits.org)
 by [git-cliff](https://git-cliff.org).
 
+## [0.2.0](https://github.com/nero408/mdmux/commit/v0.2.0) - 2026-05-18
+
+### Bug Fixes
+
+- --no-cmux double-render + rebind preview scroll keys (#4) ([04377a4](https://github.com/nero408/mdmux/commit/04377a49ab0656a5765522a2c8dcad75039c1d00))
+
+### Documentation
+
+- Spell out mdmux as Markdown Multiplexer in the title ([8020227](https://github.com/nero408/mdmux/commit/802022727ccdbe9dfea74cbb73ea8b166b693624))
 ## [0.1.2](https://github.com/nero408/mdmux/commit/v0.1.2) - 2026-05-18
 
 ### Bug Fixes
