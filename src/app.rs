@@ -331,9 +331,16 @@ impl App {
         Ok(())
     }
 
-    /// Open the currently selected markdown file. In cmux mode this opens a
-    /// new cmux markdown surface (closing the previous one first). In
-    /// in-process mode it loads the file into the preview pane.
+    /// Open the currently selected markdown file. The render mode picked at
+    /// startup decides what "open" actually does: in cmux mode we spawn a
+    /// sibling cmux markdown surface, in in-process mode we load the file
+    /// into our own preview pane.
+    ///
+    /// Critically, the two paths are mutually exclusive. Earlier versions
+    /// always called `cmux.open_markdown`, even with `--no-cmux`, which made
+    /// the cmux daemon pop a redundant pane *in addition* to the in-process
+    /// preview. The match below makes the cmux call dead code in
+    /// `RenderMode::InProcess`.
     pub fn open_selected(&mut self) -> Result<(), CmuxError> {
         let Some(row) = self.tree.visible_rows().get(self.selection).cloned() else {
             return Ok(());
@@ -341,25 +348,28 @@ impl App {
         if row.kind != NodeKind::File {
             return Ok(());
         }
-        // Close previous cmux panel if any (always tracked, even in
-        // in-process mode — the mock cmux client used by `--demo` produces
-        // fake surface ids).
-        if let Some(prev) = self.current_md_surface.take() {
-            // If close fails (surface already gone), keep going.
-            let _ = self.cmux.close_surface(&prev);
-        }
-        let res = self.cmux.open_markdown(&row.path)?;
-        self.current_md_surface = Some(res.surface);
-        self.last_opened = Some(row.path.clone());
-        if self.render_mode == RenderMode::InProcess {
-            // Best-effort load — if the file is gone since the tree walk,
-            // leave the previous preview in place rather than failing the
-            // open. The size cap in `preview::load` guards against OOM.
-            if let Some(preview) = preview::load(&row.path) {
-                self.preview = Some(preview);
-                self.preview_scroll = 0;
+        match self.render_mode {
+            RenderMode::Cmux => {
+                // Close the previous cmux panel first so the new one
+                // replaces it instead of stacking.
+                if let Some(prev) = self.current_md_surface.take() {
+                    let _ = self.cmux.close_surface(&prev);
+                }
+                let res = self.cmux.open_markdown(&row.path)?;
+                self.current_md_surface = Some(res.surface);
+            }
+            RenderMode::InProcess => {
+                // No cmux interaction at all — we own the rendering. Best-
+                // effort load: if the file is gone since the tree walk we
+                // leave the previous preview in place rather than failing.
+                // The size cap in `preview::load` guards against OOM.
+                if let Some(preview) = preview::load(&row.path) {
+                    self.preview = Some(preview);
+                    self.preview_scroll = 0;
+                }
             }
         }
+        self.last_opened = Some(row.path.clone());
         self.status = format!("→ {}", row.path.display());
         Ok(())
     }
@@ -383,9 +393,13 @@ impl App {
     }
 
     /// Best-effort close of the markdown panel we own (cmux surface in cmux
-    /// mode, preview pane in in-process mode).
+    /// mode, preview pane in in-process mode). Like [`open_selected`], the
+    /// two paths are mutually exclusive — in `InProcess` mode there's no
+    /// cmux surface to close, so we don't attempt the cmux call.
     pub fn close_markdown_panel(&mut self) {
-        if let Some(s) = self.current_md_surface.take() {
+        if self.render_mode == RenderMode::Cmux
+            && let Some(s) = self.current_md_surface.take()
+        {
             let _ = self.cmux.close_surface(&s);
         }
         self.preview = None;
@@ -647,6 +661,15 @@ mod tests {
             app.preview.is_some(),
             "in-process mode should populate preview"
         );
+        // Regression for the "--no-cmux still opens a cmux pane" bug:
+        // in InProcess mode `open_selected` must NOT call the cmux client,
+        // even when the client itself would respond (MockCmux always
+        // succeeds). We assert that by checking the surface tracker stays
+        // unset — it's only assigned when cmux.open_markdown actually ran.
+        assert!(
+            app.current_md_surface.is_none(),
+            "in-process mode must not call cmux.open_markdown"
+        );
     }
 
     #[test]
@@ -667,6 +690,38 @@ mod tests {
         assert!(
             app.preview.is_none(),
             "cmux mode should leave preview empty"
+        );
+        // Conversely: cmux mode must populate the surface tracker.
+        assert!(
+            app.current_md_surface.is_some(),
+            "cmux mode must call cmux.open_markdown"
+        );
+    }
+
+    /// In InProcess mode `close_markdown_panel` should drop the preview but
+    /// not poke the cmux client. We can't observe the mock through the
+    /// trait object, so we set `current_md_surface` by hand and check it
+    /// survives the close call (which would `.take()` it in cmux mode).
+    #[test]
+    fn close_markdown_panel_in_inprocess_does_not_touch_cmux() {
+        let r = temp("close_inproc");
+        touch(&r.join("a.md"));
+        let mock = MockCmux::new();
+        let mut app = App::new(r, Box::new(mock)).unwrap();
+        app.render_mode = RenderMode::InProcess;
+        app.preview = Some(Preview {
+            path: PathBuf::from("a.md"),
+            lines: vec!["hi".into()],
+            truncated: false,
+        });
+        // Simulate a stale surface left over from somewhere — close should
+        // ignore it because we're in InProcess mode.
+        app.current_md_surface = Some(SurfaceId("surface:stale".to_string()));
+        app.close_markdown_panel();
+        assert!(app.preview.is_none(), "preview cleared on close");
+        assert!(
+            app.current_md_surface.is_some(),
+            "cmux surface NOT taken in in-process mode"
         );
     }
 

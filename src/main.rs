@@ -294,11 +294,20 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
 }
 
 /// A reasonable "half-page" magnitude for the in-process preview's
-/// `Ctrl-D` / `Ctrl-U` scroll. We don't have access to the live pane height
-/// at the keypress site, so we use a fixed value that matches the typical
-/// 24–32 row terminal pretty well.
+/// shift-J / shift-K (and Ctrl-D / Ctrl-U) scroll. We don't have access
+/// to the live pane height at the keypress site, so we use a fixed value
+/// that matches the typical 24–32 row terminal pretty well.
 fn half_screen() -> u16 {
     12
+}
+
+/// "Full-page" magnitude for `j` / `k` when a preview is open. Same
+/// caveat as [`half_screen`] — we don't see the live pane height here,
+/// so we pick a constant that feels like a page on a normal-sized
+/// terminal and leaves a couple of rows of overlap with the previous
+/// view.
+fn page_size() -> u16 {
+    22
 }
 
 fn handle_key(app: &mut App, key: KeyEvent, pending: &mut Option<char>) -> Action {
@@ -479,13 +488,16 @@ fn handle_key(app: &mut App, key: KeyEvent, pending: &mut Option<char>) -> Actio
         },
         KeyCode::Char('E') => app.expand_all(),
         KeyCode::Char('C') => app.collapse_all(),
-        // Preview pane scrolling. We bind shift-J/K and Ctrl-D/Ctrl-U so we
-        // don't collide with tree j/k. These are no-ops when no preview is
-        // open (cmux mode), which makes the same keys safe everywhere.
-        // Ctrl-U lives above next to the plain `u` arm because the guarded
-        // version must come first for the match to pick it.
-        KeyCode::Char('J') => app.preview_scroll_down(1),
-        KeyCode::Char('K') => app.preview_scroll_up(1),
+        // Preview pane scrolling. When a preview is showing, j/k scroll a
+        // full page, and shift-J/K (plus Ctrl-D/Ctrl-U) scroll half a page.
+        // When no preview is open (cmux mode, or in-process mode before
+        // anything was opened) j/k fall through to tree navigation — see
+        // the unguarded arms below. Ctrl-U is matched higher up next to the
+        // plain `u` arm so the guarded variant wins.
+        KeyCode::Char('j') if app.preview.is_some() => app.preview_scroll_down(page_size()),
+        KeyCode::Char('k') if app.preview.is_some() => app.preview_scroll_up(page_size()),
+        KeyCode::Char('J') => app.preview_scroll_down(half_screen()),
+        KeyCode::Char('K') => app.preview_scroll_up(half_screen()),
         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.preview_scroll_down(half_screen())
         }
