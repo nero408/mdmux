@@ -160,6 +160,38 @@ vhs assets/demo.tape              # writes assets/demo.gif
 The tape uses `mdmux --demo`, which substitutes a built-in fake cmux client
 so the gif can be produced on machines without cmux installed.
 
+### Releasing (maintainers)
+
+Cutting a release is one command — push a `v*` tag. CI handles the rest:
+
+```sh
+# bump version in Cargo.toml, commit, then:
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+The [`release` workflow](.github/workflows/release.yml) then:
+
+1. Builds release binaries for `aarch64-apple-darwin`, `x86_64-apple-darwin`,
+   and `x86_64-unknown-linux-gnu` on native runners.
+2. Packages each as `mdmux-vX.Y.Z-<target>.tar.gz` + a `.sha256` sidecar.
+3. Creates a GitHub Release with auto-generated notes and attaches the
+   tarballs.
+4. Pushes an updated `Formula/mdmux.rb` to the
+   [`nero408/homebrew-tap`](https://github.com/nero408/homebrew-tap) repo
+   so `brew install nero408/tap/mdmux` picks up the new version
+   immediately.
+
+**One-time setup** (only needed before the very first release):
+
+1. Create an empty public repo: `nero408/homebrew-tap`.
+2. Generate a fine-grained PAT with `Contents: read and write` scope on
+   that single repo.
+3. Add it to `nero408/mdmux` as the `HOMEBREW_TAP_TOKEN` secret.
+
+If the token is missing the workflow still publishes the GitHub Release;
+it just skips the tap bump with a warning.
+
 ## License
 
 [MIT](LICENSE) © nero408
