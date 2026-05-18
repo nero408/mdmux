@@ -20,10 +20,11 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use mdmux::app::{Action, App, Mode};
+use mdmux::app::{Action, App, Mode, RenderMode};
 use mdmux::cmux::{CliCmux, CmuxClient, mock::MockCmux};
 use mdmux::tree::NodeKind;
 use mdmux::ui::draw;
+use mdmux::watcher::FileWatcher;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -65,6 +66,13 @@ struct Cli {
     /// gifs, and CI smoke tests on machines without cmux installed.
     #[arg(long)]
     demo: bool,
+
+    /// Render the markdown panel inside mdmux itself instead of asking cmux
+    /// for a sibling pane. Useful if you don't run cmux, or if you want to
+    /// preview without spawning an external pane. Default is to use cmux
+    /// when it's available and fall back to in-process automatically.
+    #[arg(long)]
+    no_cmux: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -78,6 +86,9 @@ fn main() -> anyhow::Result<()> {
         return list_files(root, &cli);
     }
 
+    // Pick a cmux client first so we can probe for availability. If the user
+    // asked for `--demo`, swap in the in-memory mock (the demo gif and CI
+    // smoke tests don't have a real cmux to talk to).
     let cmux: Box<dyn CmuxClient> = if cli.demo {
         Box::new(MockCmux::new())
     } else {
@@ -87,22 +98,41 @@ fn main() -> anyhow::Result<()> {
     };
     let cmux_available = cmux.is_available();
 
+    // Render mode decision:
+    //   --demo                          → InProcess (gif-friendly preview)
+    //   --no-cmux                       → InProcess (user opted out)
+    //   cmux not reachable              → InProcess (graceful fallback)
+    //   otherwise                       → Cmux (default, current behavior)
+    let render_mode = if cli.demo || cli.no_cmux || !cmux_available {
+        RenderMode::InProcess
+    } else {
+        RenderMode::Cmux
+    };
+
     let mut app = App::new(root, cmux)?;
     app.config.show_hidden = cli.hidden;
     app.config.respect_gitignore = !cli.no_gitignore;
     app.config.max_depth = cli.max_depth;
     app.demo_mode = cli.demo;
+    app.render_mode = render_mode;
     app.refresh()?;
-    if !cmux_available {
-        app.mode = Mode::Error {
-            message: "cmux is not running or 'cmux' CLI is not on PATH.\n\
-                      Start cmux and try again. The TUI will still let you browse,\n\
-                      but Enter won't be able to open the markdown panel."
-                .into(),
-        };
-    } else {
-        app.status = format!("ready · {} files", app.tree.file_count());
-    }
+    app.status = match render_mode {
+        RenderMode::Cmux => format!("ready · {} files · cmux", app.tree.file_count()),
+        RenderMode::InProcess => {
+            if cli.demo {
+                format!("ready · {} files · demo preview", app.tree.file_count())
+            } else if cli.no_cmux {
+                format!("ready · {} files · in-process", app.tree.file_count())
+            } else {
+                // We fell back because cmux is missing. Tell the user
+                // softly via the status line; don't pop a modal error.
+                format!(
+                    "ready · {} files · cmux not running → in-process preview",
+                    app.tree.file_count()
+                )
+            }
+        }
+    };
 
     run_tui(app)
 }
@@ -131,7 +161,16 @@ fn run_tui(mut app: App) -> anyhow::Result<()> {
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = event_loop(&mut terminal, &mut app);
+    // Only spin up a filesystem watcher when we actually own the rendering
+    // (in-process mode). In cmux mode the cmux daemon does its own
+    // live-reload and our watcher would just burn descriptors.
+    let watcher = if app.render_mode == RenderMode::InProcess {
+        FileWatcher::new()
+    } else {
+        None
+    };
+
+    let result = event_loop(&mut terminal, &mut app, watcher);
 
     // Always restore the terminal before exiting.
     restore_terminal(&mut terminal)?;
@@ -175,19 +214,52 @@ fn install_panic_hook() {
 fn event_loop<B: ratatui::backend::Backend + std::io::Write>(
     terminal: &mut Terminal<B>,
     app: &mut App,
+    mut watcher: Option<FileWatcher>,
 ) -> anyhow::Result<Action> {
     let mut pending: Option<char> = None;
-    // Always draw on entry. After that, only redraw when something actually
-    // changes (an event arrived). Polling forever and redrawing 4x/second
-    // burned CPU on idle terminals.
+    // Path the watcher is currently tuned to. Tracked here so we can detect
+    // when the user opens a different file and need to re-arm the watch.
+    let mut watched_path: Option<std::path::PathBuf> = None;
+
+    // Always draw on entry. After that, redraw only when something happens.
     terminal.draw(|f| draw(f, app))?;
     loop {
-        // Block until an event is available. No timeout — a real input event,
-        // resize, or mouse scroll is what should wake us up.
-        if !poll(Duration::from_secs(60 * 60 * 24))? {
-            // Spurious wakeup. Loop back without doing anything.
+        // If the preview is showing a file, make sure the watcher is tuned
+        // to it. Re-arming is cheap and idempotent on the same path.
+        if let (Some(w), Some(p)) = (
+            watcher.as_mut(),
+            app.preview.as_ref().map(|p| p.path.clone()),
+        ) && watched_path.as_ref() != Some(&p)
+        {
+            let _ = w.watch(&p);
+            watched_path = Some(p);
+        }
+
+        // Pick a poll timeout. When the file watcher is active and a file is
+        // open we want a tight loop (200ms) so live-reload feels instant.
+        // Otherwise block for a long time — there's nothing else that should
+        // wake us up between key presses.
+        let want_watch = watcher.is_some() && app.preview.is_some();
+        let timeout = if want_watch {
+            Duration::from_millis(200)
+        } else {
+            Duration::from_secs(60 * 60 * 24)
+        };
+
+        if !poll(timeout)? {
+            // Timeout expired. If we're watching a file, drain the watcher
+            // and reload on a hit; otherwise just go back to sleep.
+            if let (Some(w), Some(p)) = (
+                watcher.as_mut(),
+                app.preview.as_ref().map(|p| p.path.clone()),
+            ) && w.drain_for(&p)
+                && app.reload_preview()
+            {
+                terminal.draw(|f| draw(f, app))?;
+            }
             continue;
         }
+
         match read()? {
             Event::Key(key) => {
                 if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
@@ -219,6 +291,14 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
         MouseEventKind::ScrollUp => app.move_up(),
         _ => {}
     }
+}
+
+/// A reasonable "half-page" magnitude for the in-process preview's
+/// `Ctrl-D` / `Ctrl-U` scroll. We don't have access to the live pane height
+/// at the keypress site, so we use a fixed value that matches the typical
+/// 24–32 row terminal pretty well.
+fn half_screen() -> u16 {
+    12
 }
 
 fn handle_key(app: &mut App, key: KeyEvent, pending: &mut Option<char>) -> Action {
@@ -362,6 +442,11 @@ fn handle_key(app: &mut App, key: KeyEvent, pending: &mut Option<char>) -> Actio
             app.close_markdown_panel();
             app.status = "panel closed".into();
         }
+        // Ctrl-U scrolls the preview half a page. Has to come before the
+        // plain `u` arm so the guard wins.
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.preview_scroll_up(half_screen())
+        }
         KeyCode::Char('u') => match app.parent_root() {
             Ok(_) => {}
             Err(e) => {
@@ -394,6 +479,16 @@ fn handle_key(app: &mut App, key: KeyEvent, pending: &mut Option<char>) -> Actio
         },
         KeyCode::Char('E') => app.expand_all(),
         KeyCode::Char('C') => app.collapse_all(),
+        // Preview pane scrolling. We bind shift-J/K and Ctrl-D/Ctrl-U so we
+        // don't collide with tree j/k. These are no-ops when no preview is
+        // open (cmux mode), which makes the same keys safe everywhere.
+        // Ctrl-U lives above next to the plain `u` arm because the guarded
+        // version must come first for the match to pick it.
+        KeyCode::Char('J') => app.preview_scroll_down(1),
+        KeyCode::Char('K') => app.preview_scroll_up(1),
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.preview_scroll_down(half_screen())
+        }
         KeyCode::Char('j') | KeyCode::Down => app.move_down(),
         KeyCode::Char('k') | KeyCode::Up => app.move_up(),
         KeyCode::PageDown => app.page_down(),
