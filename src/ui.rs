@@ -10,7 +10,8 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
-use crate::app::{App, DemoPreview, Mode};
+use crate::app::{App, Mode};
+use crate::preview::Preview;
 use crate::tree::NodeKind;
 
 /// Replace control characters in a string with a visible placeholder so they
@@ -42,16 +43,18 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     draw_title(f, app, chunks[0]);
 
-    // In demo mode, once a file has been opened we split the body
-    // horizontally and render its content on the right. In real use, the
-    // right pane is owned by cmux.
-    let preview_snapshot = app.demo_preview.clone();
+    // When the preview pane is active (in-process render mode + a file
+    // open) we split the body horizontally and render the markdown on the
+    // right. In cmux mode the right pane is a sibling cmux surface, owned
+    // by cmux — we leave the body to the file tree alone.
+    let preview_snapshot = app.preview.clone();
+    let preview_scroll = app.preview_scroll;
     let tree_area = if let Some(ref preview) = preview_snapshot {
         let body = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
             .split(chunks[1]);
-        draw_demo_preview(f, preview, body[1]);
+        draw_preview(f, preview, body[1], preview_scroll);
         body[0]
     } else {
         chunks[1]
@@ -456,9 +459,16 @@ const HELP_LINES: &[(&str, &str)] = &[
     ("C", "collapse all"),
     ("", ""),
     ("", "Opening files"),
-    ("enter / o", "open selected markdown in cmux panel"),
+    (
+        "enter / o",
+        "open selected markdown (cmux panel or in-process pane)",
+    ),
     ("a", "toggle auto-open while navigating"),
-    ("x", "close current cmux markdown panel"),
+    ("x", "close the open panel"),
+    ("", ""),
+    ("", "Preview (in-process render mode)"),
+    ("J / K", "scroll preview down / up"),
+    ("ctrl-d / u", "scroll preview half a page"),
     ("", ""),
     ("", "Change directory"),
     ("cd", "make selected directory the new root"),
@@ -479,113 +489,38 @@ const HELP_LINES: &[(&str, &str)] = &[
     ("Q", "quit (keep cmux panel open)"),
 ];
 
-fn draw_demo_preview(f: &mut Frame, preview: &DemoPreview, area: Rect) {
+fn draw_preview(f: &mut Frame, preview: &Preview, area: Rect, scroll: u16) {
     let filename = preview
         .path
         .file_name()
-        .and_then(|s| s.to_str())
+        .and_then(|s: &std::ffi::OsStr| s.to_str())
         .unwrap_or("?");
+    let mut title_spans = vec![
+        Span::raw(" 📝 "),
+        Span::styled(
+            sanitize_for_display(filename),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  · live reload  ", Style::default().fg(Color::DarkGray)),
+    ];
+    if preview.truncated {
+        title_spans.push(Span::styled(
+            "[truncated] ",
+            Style::default().fg(Color::Yellow),
+        ));
+    }
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
-        .title(Line::from(vec![
-            Span::raw(" 📝 "),
-            Span::styled(
-                sanitize_for_display(filename),
-                Style::default()
-                    .fg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "  · live reload (demo)  ",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
-    let para = Paragraph::new(render_markdown_lines(&preview.lines))
+        .title(Line::from(title_spans));
+    let text = preview.render();
+    let para = Paragraph::new(text)
         .block(block)
-        .wrap(Wrap { trim: false });
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
     f.render_widget(para, area);
-}
-
-/// Lightly-styled markdown → ratatui lines. Not a full parser — handles the
-/// constructs that make a 10-second demo gif look right (headings, fenced
-/// code blocks, list items, blockquotes, horizontal rules). Anything else
-/// passes through unchanged.
-///
-/// Every line is sanitized first: a `.md` file is just bytes and can contain
-/// embedded escape sequences. We never want those to reach the terminal raw.
-fn render_markdown_lines(lines: &[String]) -> Vec<Line<'static>> {
-    let mut out: Vec<Line<'static>> = Vec::with_capacity(lines.len());
-    let mut in_code = false;
-    for raw in lines {
-        let raw = sanitize_for_display(raw);
-        let line = raw.as_str();
-        if let Some(rest) = line.strip_prefix("```") {
-            in_code = !in_code;
-            let label = if in_code && !rest.is_empty() {
-                format!("  ─── {} ───", rest.trim())
-            } else {
-                "  ─────────".to_string()
-            };
-            out.push(Line::from(Span::styled(
-                label,
-                Style::default().fg(Color::DarkGray),
-            )));
-            continue;
-        }
-        if in_code {
-            out.push(Line::from(Span::styled(
-                format!("    {}", line),
-                Style::default().fg(Color::LightGreen),
-            )));
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("### ") {
-            out.push(Line::from(Span::styled(
-                format!("  {}", rest),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )));
-        } else if let Some(rest) = line.strip_prefix("## ") {
-            out.push(Line::from(Span::styled(
-                format!(" {}", rest),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )));
-        } else if let Some(rest) = line.strip_prefix("# ") {
-            out.push(Line::from(Span::styled(
-                rest.to_string(),
-                Style::default()
-                    .fg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-            )));
-        } else if let Some(rest) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
-            out.push(Line::from(vec![
-                Span::styled("  • ", Style::default().fg(Color::Cyan)),
-                Span::raw(rest.to_string()),
-            ]));
-        } else if let Some(rest) = line.strip_prefix("> ") {
-            out.push(Line::from(vec![
-                Span::styled("┃ ", Style::default().fg(Color::Yellow)),
-                Span::styled(
-                    rest.to_string(),
-                    Style::default()
-                        .fg(Color::Gray)
-                        .add_modifier(Modifier::ITALIC),
-                ),
-            ]));
-        } else if line.trim() == "---" || line.trim() == "***" {
-            out.push(Line::from(Span::styled(
-                "─".repeat(40),
-                Style::default().fg(Color::DarkGray),
-            )));
-        } else {
-            out.push(Line::from(Span::raw(raw.clone())));
-        }
-    }
-    out
 }
 
 #[cfg(test)]

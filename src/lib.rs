@@ -7,5 +7,7 @@
 
 pub mod app;
 pub mod cmux;
+pub mod preview;
 pub mod tree;
 pub mod ui;
+pub mod watcher;

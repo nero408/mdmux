@@ -1,13 +1,15 @@
 //! Application state machine for the TUI.
 //!
-//! Keeps the file tree, selection, navigation stack, and the surface id of
-//! the markdown panel currently open in cmux. All UI side-effects go through
-//! the [`CmuxClient`](crate::cmux::CmuxClient) trait so unit tests can use a
-//! mock.
+//! Keeps the file tree, selection, navigation stack, and either the surface
+//! id of an external cmux panel ([`RenderMode::Cmux`]) or a snapshot of the
+//! currently-open file rendered in mdmux's own pane ([`RenderMode::InProcess`]).
+//! All cmux side-effects go through the [`CmuxClient`](crate::cmux::CmuxClient)
+//! trait so unit tests can use a mock.
 
 use std::path::{Path, PathBuf};
 
 use crate::cmux::{CmuxClient, CmuxError, SurfaceId};
+use crate::preview::{self, Preview};
 use crate::tree::{NodeKind, Tree, TreeConfig};
 
 /// Upper bound on how many roots we remember for the `b` (back) key. A user
@@ -15,17 +17,21 @@ use crate::tree::{NodeKind, Tree, TreeConfig};
 /// history than anyone can usefully reach for.
 const HISTORY_CAP: usize = 64;
 
-/// Upper bound on the file size we slurp for the in-process demo preview pane.
-/// Demo mode is for quick screenshots/gifs, so capping at 1 MiB keeps a typo
-/// (`mdmux --demo /` then pressing Enter on a giant log file) from OOM-ing
-/// the process. Real use delegates rendering to cmux, which has its own
-/// streaming strategy.
-const DEMO_PREVIEW_MAX_BYTES: u64 = 1024 * 1024;
-
-/// Upper bound on the number of lines we keep for the demo preview pane.
-/// Defends against pathologically long lines or files with millions of lines
-/// (the preview pane only shows a few dozen anyway).
-const DEMO_PREVIEW_MAX_LINES: usize = 5_000;
+/// Where the rendered markdown panel lives.
+///
+/// - [`Cmux`](Self::Cmux): we shell out to `cmux markdown open` and the
+///   panel is a sibling cmux pane outside our process. The default when a
+///   cmux daemon is reachable.
+/// - [`InProcess`](Self::InProcess): we render the markdown inside mdmux's
+///   own ratatui surface (a horizontal split: tree on the left, preview on
+///   the right). Selected automatically when cmux is missing, or forced via
+///   `--no-cmux` / `--demo`. The preview pane is live-reloaded from disk by
+///   [`crate::watcher::FileWatcher`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderMode {
+    Cmux,
+    InProcess,
+}
 
 /// Top-level UI mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,16 +46,6 @@ pub enum Mode {
     GoTo { input: String },
     /// Transient error toast.
     Error { message: String },
-}
-
-/// Snapshot of a file loaded for the in-process demo preview pane.
-///
-/// Only populated when [`App::demo_mode`] is true. In normal use, the right
-/// pane is rendered by cmux itself, outside mdmux.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DemoPreview {
-    pub path: PathBuf,
-    pub lines: Vec<String>,
 }
 
 /// Result of handling a key — what the event loop should do next.
@@ -79,12 +75,19 @@ pub struct App {
     pub auto_open: bool,
     /// Status line message shown briefly after an action.
     pub status: String,
-    /// When true, the TUI grows an in-process preview pane (see
-    /// [`DemoPreview`]) on file open. Used for `--demo` (screenshots / gifs);
-    /// the real binary delegates rendering to cmux.
+    /// When true, the status bar shows the (fake) surface id even though
+    /// nothing was actually opened in cmux. Used by `--demo` so the gif looks
+    /// realistic on machines without cmux installed.
     pub demo_mode: bool,
-    /// Content of the most recently opened file when [`Self::demo_mode`] is on.
-    pub demo_preview: Option<DemoPreview>,
+    /// Where the rendered markdown lives. Decided at startup based on cmux
+    /// availability + CLI flags. See [`RenderMode`].
+    pub render_mode: RenderMode,
+    /// Content of the most recently opened file. Populated when
+    /// `render_mode == RenderMode::InProcess`; ignored in cmux mode (where
+    /// cmux owns rendering).
+    pub preview: Option<Preview>,
+    /// Scroll offset (in lines) within the preview pane. `0` shows the top.
+    pub preview_scroll: u16,
 }
 
 impl App {
@@ -105,7 +108,9 @@ impl App {
             auto_open: false,
             status: String::new(),
             demo_mode: false,
-            demo_preview: None,
+            render_mode: RenderMode::Cmux,
+            preview: None,
+            preview_scroll: 0,
         })
     }
 
@@ -326,8 +331,9 @@ impl App {
         Ok(())
     }
 
-    /// Open the currently selected markdown file in cmux (replacing any
-    /// previously opened panel).
+    /// Open the currently selected markdown file. In cmux mode this opens a
+    /// new cmux markdown surface (closing the previous one first). In
+    /// in-process mode it loads the file into the preview pane.
     pub fn open_selected(&mut self) -> Result<(), CmuxError> {
         let Some(row) = self.tree.visible_rows().get(self.selection).cloned() else {
             return Ok(());
@@ -335,7 +341,9 @@ impl App {
         if row.kind != NodeKind::File {
             return Ok(());
         }
-        // Close previous panel if any.
+        // Close previous cmux panel if any (always tracked, even in
+        // in-process mode — the mock cmux client used by `--demo` produces
+        // fake surface ids).
         if let Some(prev) = self.current_md_surface.take() {
             // If close fails (surface already gone), keep going.
             let _ = self.cmux.close_surface(&prev);
@@ -343,25 +351,76 @@ impl App {
         let res = self.cmux.open_markdown(&row.path)?;
         self.current_md_surface = Some(res.surface);
         self.last_opened = Some(row.path.clone());
-        if self.demo_mode {
-            // Best-effort: if the file can't be read we just leave the prior
-            // preview in place rather than failing the open. Reads are capped
-            // so pointing the demo at a giant file (accidentally or
-            // intentionally) doesn't OOM us.
-            if let Some(preview) = load_demo_preview(&row.path) {
-                self.demo_preview = Some(preview);
+        if self.render_mode == RenderMode::InProcess {
+            // Best-effort load — if the file is gone since the tree walk,
+            // leave the previous preview in place rather than failing the
+            // open. The size cap in `preview::load` guards against OOM.
+            if let Some(preview) = preview::load(&row.path) {
+                self.preview = Some(preview);
+                self.preview_scroll = 0;
             }
         }
         self.status = format!("→ {}", row.path.display());
         Ok(())
     }
 
-    /// Best-effort close of the markdown panel we own.
+    /// Reload the currently-open file from disk (live-reload trigger).
+    /// Called by the event loop when the file watcher reports a change.
+    /// Returns `true` if the preview was actually updated.
+    pub fn reload_preview(&mut self) -> bool {
+        let Some(p) = self.preview.as_ref().map(|p| p.path.clone()) else {
+            return false;
+        };
+        if let Some(fresh) = preview::load(&p) {
+            // Preserve scroll position so a save mid-scroll doesn't jump the
+            // viewer back to the top. Clamp later in `clamp_preview_scroll`
+            // if the file got shorter.
+            self.preview = Some(fresh);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Best-effort close of the markdown panel we own (cmux surface in cmux
+    /// mode, preview pane in in-process mode).
     pub fn close_markdown_panel(&mut self) {
         if let Some(s) = self.current_md_surface.take() {
             let _ = self.cmux.close_surface(&s);
         }
-        self.demo_preview = None;
+        self.preview = None;
+        self.preview_scroll = 0;
+    }
+
+    /// Scroll the in-process preview pane up by one line. No-op when there
+    /// is no preview open.
+    pub fn preview_scroll_up(&mut self, n: u16) {
+        self.preview_scroll = self.preview_scroll.saturating_sub(n);
+    }
+
+    /// Scroll the in-process preview pane down by `n` lines. The exact upper
+    /// bound is clamped in the renderer where the pane height is known —
+    /// here we cap to the preview's line count so we can't run past the end.
+    pub fn preview_scroll_down(&mut self, n: u16) {
+        let max = self
+            .preview
+            .as_ref()
+            .map(|p| p.lines.len().saturating_sub(1) as u16)
+            .unwrap_or(0);
+        self.preview_scroll = self.preview_scroll.saturating_add(n).min(max);
+    }
+
+    pub fn preview_scroll_to_top(&mut self) {
+        self.preview_scroll = 0;
+    }
+
+    pub fn preview_scroll_to_bottom(&mut self) {
+        let max = self
+            .preview
+            .as_ref()
+            .map(|p| p.lines.len().saturating_sub(1) as u16)
+            .unwrap_or(0);
+        self.preview_scroll = max;
     }
 
     pub fn enter_help(&mut self) {
@@ -394,31 +453,6 @@ impl App {
         self.tree.set_filter("");
         self.clamp_selection();
     }
-}
-
-/// Read a file for the demo preview pane, returning `None` if the file is
-/// unreadable. The read is capped at [`DEMO_PREVIEW_MAX_BYTES`] and the line
-/// count at [`DEMO_PREVIEW_MAX_LINES`] so pointing the demo at a giant log,
-/// a binary, or a pathologically long line can't OOM the process.
-fn load_demo_preview(path: &Path) -> Option<DemoPreview> {
-    use std::io::Read;
-    let f = std::fs::File::open(path).ok()?;
-    let mut buf = Vec::new();
-    // `take(N)` caps the read so we never allocate more than N bytes.
-    f.take(DEMO_PREVIEW_MAX_BYTES).read_to_end(&mut buf).ok()?;
-    let s = String::from_utf8_lossy(&buf);
-    let mut lines: Vec<String> = s
-        .lines()
-        .take(DEMO_PREVIEW_MAX_LINES)
-        .map(String::from)
-        .collect();
-    if lines.len() == DEMO_PREVIEW_MAX_LINES {
-        lines.push("…(preview truncated)".to_string());
-    }
-    Some(DemoPreview {
-        path: path.to_path_buf(),
-        lines,
-    })
 }
 
 #[cfg(test)]
@@ -594,21 +628,98 @@ mod tests {
     }
 
     #[test]
-    fn load_demo_preview_caps_large_files() {
-        let r = temp("demo_cap");
-        let big = r.join("huge.md");
-        fs::create_dir_all(big.parent().unwrap()).unwrap();
-        // Write 2 MiB of `a`'s — twice the preview cap.
-        let content = "a".repeat((DEMO_PREVIEW_MAX_BYTES * 2) as usize);
-        fs::write(&big, content).unwrap();
-        let preview = load_demo_preview(&big).unwrap();
-        // Only the capped slice ends up in memory.
-        let total_bytes: usize = preview.lines.iter().map(|l| l.len()).sum();
+    fn open_selected_populates_preview_in_inprocess_mode() {
+        let r = temp("inproc_open");
+        touch(&r.join("hello.md"));
+        let mock = MockCmux::new();
+        let mut app = App::new(r, Box::new(mock)).unwrap();
+        app.render_mode = RenderMode::InProcess;
+        // Find the file row.
+        app.viewport_height = 10;
+        for _ in 0..app.tree.visible_rows().len() {
+            if app.current_row_kind() == Some(NodeKind::File) {
+                break;
+            }
+            app.selection += 1;
+        }
+        app.open_selected().unwrap();
         assert!(
-            (total_bytes as u64) <= DEMO_PREVIEW_MAX_BYTES,
-            "loaded {} bytes (cap is {})",
-            total_bytes,
-            DEMO_PREVIEW_MAX_BYTES
+            app.preview.is_some(),
+            "in-process mode should populate preview"
         );
+    }
+
+    #[test]
+    fn open_selected_skips_preview_in_cmux_mode() {
+        let r = temp("cmux_open");
+        touch(&r.join("hello.md"));
+        let mock = MockCmux::new();
+        let mut app = App::new(r, Box::new(mock)).unwrap();
+        app.render_mode = RenderMode::Cmux;
+        app.viewport_height = 10;
+        for _ in 0..app.tree.visible_rows().len() {
+            if app.current_row_kind() == Some(NodeKind::File) {
+                break;
+            }
+            app.selection += 1;
+        }
+        app.open_selected().unwrap();
+        assert!(
+            app.preview.is_none(),
+            "cmux mode should leave preview empty"
+        );
+    }
+
+    #[test]
+    fn preview_scroll_is_bounded() {
+        let r = temp("scroll");
+        touch(&r.join("a.md"));
+        let mock = MockCmux::new();
+        let mut app = App::new(r, Box::new(mock)).unwrap();
+        app.render_mode = RenderMode::InProcess;
+        // No preview loaded — scrolling is a no-op.
+        app.preview_scroll_down(100);
+        assert_eq!(app.preview_scroll, 0);
+
+        // With a preview, scroll_down caps at lines.len()-1.
+        app.preview = Some(Preview {
+            path: PathBuf::from("a.md"),
+            lines: vec!["one".into(), "two".into(), "three".into()],
+            truncated: false,
+        });
+        app.preview_scroll_down(1000);
+        assert_eq!(app.preview_scroll, 2);
+        app.preview_scroll_up(100);
+        assert_eq!(app.preview_scroll, 0);
+        app.preview_scroll_to_bottom();
+        assert_eq!(app.preview_scroll, 2);
+        app.preview_scroll_to_top();
+        assert_eq!(app.preview_scroll, 0);
+    }
+
+    #[test]
+    fn reload_preview_picks_up_disk_changes() {
+        let r = temp("reload");
+        let path = r.join("doc.md");
+        touch(&path);
+        std::fs::write(&path, "before").unwrap();
+        let mock = MockCmux::new();
+        let mut app = App::new(r, Box::new(mock)).unwrap();
+        app.render_mode = RenderMode::InProcess;
+        app.preview = preview::load(&path);
+        let original = app.preview.as_ref().unwrap().lines.clone();
+        std::fs::write(&path, "after").unwrap();
+        assert!(app.reload_preview());
+        let updated = app.preview.as_ref().unwrap().lines.clone();
+        assert_ne!(original, updated);
+    }
+
+    #[test]
+    fn render_mode_defaults_to_cmux() {
+        let r = temp("default_mode");
+        touch(&r.join("a.md"));
+        let mock = MockCmux::new();
+        let app = App::new(r, Box::new(mock)).unwrap();
+        assert_eq!(app.render_mode, RenderMode::Cmux);
     }
 }
