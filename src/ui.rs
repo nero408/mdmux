@@ -13,6 +13,21 @@ use ratatui::{
 use crate::app::{App, DemoPreview, Mode};
 use crate::tree::NodeKind;
 
+/// Replace control characters in a string with a visible placeholder so they
+/// can't reach the terminal and execute as escape sequences. Filenames,
+/// markdown file contents in demo mode, and other "untrusted" text all need
+/// to go through this before becoming a `Span`.
+///
+/// Filenames on Unix can contain anything but `/` and `\0`. A file named
+/// `\x1b[2J\x1b[H` could otherwise clear the screen and reposition the
+/// cursor when rendered. Tabs and newlines are also stripped because they
+/// disrupt the single-line layout of the file tree.
+pub(crate) fn sanitize_for_display(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .collect()
+}
+
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let chunks = Layout::default()
@@ -59,7 +74,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 }
 
 fn draw_title(f: &mut Frame, app: &App, area: Rect) {
-    let root = app.tree.root().display().to_string();
+    let root = sanitize_for_display(&app.tree.root().display().to_string());
     let line = Line::from(vec![
         Span::styled(
             " mdmux ",
@@ -122,11 +137,13 @@ fn draw_tree(f: &mut Frame, app: &mut App, area: Rect) {
                     .add_modifier(Modifier::BOLD),
                 NodeKind::File => Style::default().fg(Color::White),
             };
-            // Highlight filter substring for files.
+            // Highlight filter substring for files. Filenames are sanitized
+            // so terminal escape sequences embedded in a name can't hijack
+            // the renderer.
             let spans: Vec<Span> = if !filter.is_empty() && r.kind == NodeKind::File {
                 highlight_match(&r.name, &filter, style)
             } else {
-                vec![Span::styled(r.name.clone(), style)]
+                vec![Span::styled(sanitize_for_display(&r.name), style)]
             };
             let mut all = vec![
                 Span::raw(indent),
@@ -153,29 +170,70 @@ fn draw_tree(f: &mut Frame, app: &mut App, area: Rect) {
     app.viewport_offset = state.offset();
 }
 
-fn highlight_match(name: &str, needle: &str, base: Style) -> Vec<Span<'static>> {
-    let n_lower = name.to_lowercase();
-    let q_lower = needle.to_lowercase();
-    let mut out = Vec::new();
+/// Case-insensitive substring highlighter that operates on `char` indices so
+/// it can't slice through a UTF-8 boundary.
+///
+/// The previous implementation byte-indexed into both the original string
+/// (`name`) and its lowercased form. `String::to_lowercase` can change byte
+/// length — e.g. Turkish `İ` (2 bytes) lowercases to `i\u{307}` (3 bytes) —
+/// so reusing a byte offset from one to slice the other panics
+/// (`byte index N is not a char boundary`). On a TUI in raw mode that panic
+/// leaves the user's terminal mangled.
+///
+/// Going char-by-char is O(n*m) where n = name length and m = needle length,
+/// but filenames are tiny so this is fine in practice.
+fn highlight_match(raw_name: &str, needle: &str, base: Style) -> Vec<Span<'static>> {
+    let name = sanitize_for_display(raw_name);
+    let needle = sanitize_for_display(needle);
+    if needle.is_empty() {
+        return vec![Span::styled(name, base)];
+    }
+    let name_chars: Vec<char> = name.chars().collect();
+    let needle_lower: Vec<char> = needle.chars().flat_map(|c| c.to_lowercase()).collect();
+
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
     let mut i = 0;
-    while i < name.len() {
-        if let Some(pos) = n_lower[i..].find(&q_lower) {
-            let start = i + pos;
-            let end = start + needle.len();
-            if start > i {
-                out.push(Span::styled(name[i..start].to_string(), base));
+    while i < name_chars.len() {
+        if let Some(match_len) = char_match_len(&name_chars[i..], &needle_lower) {
+            if !buf.is_empty() {
+                out.push(Span::styled(std::mem::take(&mut buf), base));
             }
-            out.push(Span::styled(
-                name[start..end].to_string(),
-                base.fg(Color::Black).bg(Color::Yellow),
-            ));
-            i = end;
+            let hit: String = name_chars[i..i + match_len].iter().collect();
+            out.push(Span::styled(hit, base.fg(Color::Black).bg(Color::Yellow)));
+            i += match_len;
         } else {
-            out.push(Span::styled(name[i..].to_string(), base));
-            break;
+            buf.push(name_chars[i]);
+            i += 1;
         }
     }
+    if !buf.is_empty() {
+        out.push(Span::styled(buf, base));
+    }
     out
+}
+
+/// If `hay[..]` starts with a case-insensitive match for `needle_lower`,
+/// returns the number of `char`s in `hay` that the match consumed. Lowercase
+/// folding can change char count (`İ` → `i \u{307}`) so the consumed length
+/// is determined against `hay`, not `needle_lower`.
+fn char_match_len(hay: &[char], needle_lower: &[char]) -> Option<usize> {
+    let mut hay_idx = 0;
+    let mut needle_idx = 0;
+    while needle_idx < needle_lower.len() {
+        if hay_idx >= hay.len() {
+            return None;
+        }
+        let folded: Vec<char> = hay[hay_idx].to_lowercase().collect();
+        for f in &folded {
+            if needle_idx >= needle_lower.len() || *f != needle_lower[needle_idx] {
+                return None;
+            }
+            needle_idx += 1;
+        }
+        hay_idx += 1;
+    }
+    Some(hay_idx)
 }
 
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
@@ -190,7 +248,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
             ),
             Span::raw(" "),
             Span::styled(
-                app.tree.filter().to_string(),
+                sanitize_for_display(app.tree.filter()),
                 Style::default().fg(Color::Yellow),
             ),
             Span::styled(
@@ -204,12 +262,12 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
             let opened = app
                 .last_opened
                 .as_ref()
-                .map(|p| p.display().to_string())
+                .map(|p| sanitize_for_display(&p.display().to_string()))
                 .unwrap_or_else(|| "(nothing opened yet)".to_string());
             let surface = app
                 .current_md_surface
                 .as_ref()
-                .map(|s| s.as_arg().to_string())
+                .map(|s| sanitize_for_display(s.as_arg()))
                 .unwrap_or_default();
             let mut spans = vec![
                 Span::styled(" open ", Style::default().bg(Color::Cyan).fg(Color::Black)),
@@ -224,7 +282,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
             if !app.status.is_empty() {
                 spans.push(Span::raw("  · "));
                 spans.push(Span::styled(
-                    app.status.clone(),
+                    sanitize_for_display(&app.status),
                     Style::default().fg(Color::Green),
                 ));
             }
@@ -328,7 +386,10 @@ fn draw_goto_overlay(f: &mut Frame, area: Rect, input: &str) {
         Line::from(""),
         Line::from(vec![
             Span::styled("› ", Style::default().fg(Color::Cyan)),
-            Span::styled(input.to_string(), Style::default().fg(Color::White)),
+            Span::styled(
+                sanitize_for_display(input),
+                Style::default().fg(Color::White),
+            ),
             Span::styled("▏", Style::default().fg(Color::Yellow)),
         ]),
         Line::from(""),
@@ -350,27 +411,33 @@ fn draw_goto_overlay(f: &mut Frame, area: Rect, input: &str) {
 fn draw_error_overlay(f: &mut Frame, area: Rect, message: &str) {
     let area = centered_rect(60, 25, area);
     f.render_widget(Clear, area);
-    let para = Paragraph::new(vec![
+    // Sanitize the message so cmux/IO error strings can't smuggle escape
+    // sequences (filenames, command output) into the overlay.
+    let sanitized = sanitize_for_display(message);
+    let mut lines = vec![
         Line::from(Span::styled(
             "Error",
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from(message.to_string()),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  press any key to dismiss",
-            Style::default().fg(Color::DarkGray),
-        )),
-    ])
-    .wrap(Wrap { trim: false })
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Red))
-            .title(" Error "),
-    )
-    .style(Style::default().bg(Color::Indexed(235)));
+    ];
+    for l in sanitized.lines() {
+        lines.push(Line::from(l.to_string()));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  press any key to dismiss",
+        Style::default().fg(Color::DarkGray),
+    )));
+    let para = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red))
+                .title(" Error "),
+        )
+        .style(Style::default().bg(Color::Indexed(235)));
     f.render_widget(para, area);
 }
 
@@ -379,7 +446,7 @@ const HELP_LINES: &[(&str, &str)] = &[
     ("↑ / k", "move selection up"),
     ("↓ / j", "move selection down"),
     ("pgup / pgdn", "page up / down"),
-    ("g / G", "jump to top / bottom"),
+    ("g g / G", "jump to top / bottom"),
     ("", ""),
     ("", "Tree"),
     ("→ / l", "expand directory"),
@@ -400,7 +467,7 @@ const HELP_LINES: &[(&str, &str)] = &[
     ("~", "go to $HOME"),
     (".", "toggle hidden files"),
     ("i", "toggle .gitignore respect"),
-    ("G p", "open 'go to path' prompt"),
+    (": / g p", "open 'go to path' prompt"),
     ("", ""),
     ("", "Search / filter"),
     ("/", "filter incrementally (Esc to clear)"),
@@ -424,7 +491,7 @@ fn draw_demo_preview(f: &mut Frame, preview: &DemoPreview, area: Rect) {
         .title(Line::from(vec![
             Span::raw(" 📝 "),
             Span::styled(
-                filename.to_string(),
+                sanitize_for_display(filename),
                 Style::default()
                     .fg(Color::Magenta)
                     .add_modifier(Modifier::BOLD),
@@ -444,10 +511,14 @@ fn draw_demo_preview(f: &mut Frame, preview: &DemoPreview, area: Rect) {
 /// constructs that make a 10-second demo gif look right (headings, fenced
 /// code blocks, list items, blockquotes, horizontal rules). Anything else
 /// passes through unchanged.
+///
+/// Every line is sanitized first: a `.md` file is just bytes and can contain
+/// embedded escape sequences. We never want those to reach the terminal raw.
 fn render_markdown_lines(lines: &[String]) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::with_capacity(lines.len());
     let mut in_code = false;
     for raw in lines {
+        let raw = sanitize_for_display(raw);
         let line = raw.as_str();
         if let Some(rest) = line.strip_prefix("```") {
             in_code = !in_code;
@@ -515,4 +586,69 @@ fn render_markdown_lines(lines: &[String]) -> Vec<Line<'static>> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for the panic where byte-indexing `name` with offsets
+    /// derived from `name.to_lowercase()` crashed on names like `İ.md`. With
+    /// the char-based implementation, this case must return cleanly even when
+    /// the lowercase form has a different char count.
+    #[test]
+    fn highlight_match_handles_unicode_case_folding_without_panic() {
+        let style = Style::default();
+        let spans = highlight_match("İ.md", "i", style);
+        // We expect at least one styled span back; the exact split doesn't
+        // matter as long as it doesn't panic.
+        assert!(!spans.is_empty());
+    }
+
+    #[test]
+    fn highlight_match_with_empty_needle_returns_whole_name() {
+        let style = Style::default();
+        let spans = highlight_match("anything.md", "", style);
+        assert_eq!(spans.len(), 1);
+    }
+
+    #[test]
+    fn highlight_match_finds_ascii_substring() {
+        let style = Style::default();
+        let spans = highlight_match("hello.md", "ll", style);
+        // "he" + "ll" + "o.md" → 3 spans.
+        assert_eq!(spans.len(), 3);
+    }
+
+    #[test]
+    fn highlight_match_is_case_insensitive() {
+        let style = Style::default();
+        let spans = highlight_match("HELLO.MD", "ll", style);
+        assert!(spans.len() >= 2);
+    }
+
+    #[test]
+    fn sanitize_strips_terminal_escape_sequences() {
+        // ESC + [2J would clear the screen if rendered raw.
+        let dirty = "\x1b[2Jevil";
+        let clean = sanitize_for_display(dirty);
+        // The escape and bracket disappear; only `evil` (plus placeholders for
+        // the escape itself) remains visible. Critically: no raw ESC byte.
+        assert!(!clean.contains('\x1b'));
+        assert!(clean.ends_with("evil"));
+    }
+
+    #[test]
+    fn sanitize_replaces_newlines_so_layout_is_preserved() {
+        let dirty = "line1\nline2\tend";
+        let clean = sanitize_for_display(dirty);
+        assert!(!clean.contains('\n'));
+        assert!(!clean.contains('\t'));
+    }
+
+    #[test]
+    fn sanitize_preserves_normal_unicode() {
+        let s = "Ångström — naïve résumé İstanbul";
+        assert_eq!(sanitize_for_display(s), s);
+    }
 }

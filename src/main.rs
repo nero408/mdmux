@@ -124,6 +124,7 @@ fn list_files(root: PathBuf, cli: &Cli) -> anyhow::Result<()> {
 }
 
 fn run_tui(mut app: App) -> anyhow::Result<()> {
+    install_panic_hook();
     enable_raw_mode()?;
     let mut out = stdout();
     execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
@@ -133,13 +134,7 @@ fn run_tui(mut app: App) -> anyhow::Result<()> {
     let result = event_loop(&mut terminal, &mut app);
 
     // Always restore the terminal before exiting.
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
+    restore_terminal(&mut terminal)?;
 
     if let Ok(Action::QuitAndClose) = result {
         app.close_markdown_panel();
@@ -147,14 +142,50 @@ fn run_tui(mut app: App) -> anyhow::Result<()> {
     result.map(|_| ())
 }
 
+fn restore_terminal<B: ratatui::backend::Backend + std::io::Write>(
+    terminal: &mut Terminal<B>,
+) -> anyhow::Result<()> {
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+    terminal.show_cursor()?;
+    Ok(())
+}
+
+/// Make sure a panic inside the event loop or the renderer doesn't leave the
+/// user with a wedged terminal (raw mode, alt screen, hidden cursor).
+///
+/// Crossterm leaves the tty in raw mode + alternate screen as soon as we
+/// enable them; if the process unwinds without explicit cleanup the user
+/// loses local echo, line discipline, and visible cursor. We restore the
+/// terminal first, then re-raise the panic so the message still reaches the
+/// scrollback.
+fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        previous(info);
+    }));
+}
+
 fn event_loop<B: ratatui::backend::Backend + std::io::Write>(
     terminal: &mut Terminal<B>,
     app: &mut App,
 ) -> anyhow::Result<Action> {
     let mut pending: Option<char> = None;
+    // Always draw on entry. After that, only redraw when something actually
+    // changes (an event arrived). Polling forever and redrawing 4x/second
+    // burned CPU on idle terminals.
+    terminal.draw(|f| draw(f, app))?;
     loop {
-        terminal.draw(|f| draw(f, app))?;
-        if !poll(Duration::from_millis(250))? {
+        // Block until an event is available. No timeout — a real input event,
+        // resize, or mouse scroll is what should wake us up.
+        if !poll(Duration::from_secs(60 * 60 * 24))? {
+            // Spurious wakeup. Loop back without doing anything.
             continue;
         }
         match read()? {
@@ -170,13 +201,15 @@ fn event_loop<B: ratatui::backend::Backend + std::io::Write>(
                     Action::Quit | Action::QuitAndClose => {
                         return Ok(Action::QuitAndClose);
                     }
-                    Action::Noop | Action::Redraw => {}
+                    Action::Noop => continue,
+                    Action::Redraw => {}
                 }
             }
             Event::Mouse(m) => handle_mouse(app, m),
             Event::Resize(_, _) => {}
-            _ => {}
+            _ => continue,
         }
+        terminal.draw(|f| draw(f, app))?;
     }
 }
 
@@ -254,11 +287,21 @@ fn handle_key(app: &mut App, key: KeyEvent, pending: &mut Option<char>) -> Actio
         Mode::Browse => {}
     }
 
-    // Two-key sequences (vim-style).
+    // Two-key sequences (vim-style). A non-matching second key falls through
+    // so the second key is interpreted on its own — this matches `vim`'s
+    // behavior for partial sequences and matters because we want `g`
+    // followed by an arrow key to mean "deselect the prefix, process the
+    // arrow key".
     if let Some(prev) = pending.take() {
         match (prev, key.code) {
             ('g', KeyCode::Char('g')) => {
                 app.go_top();
+                return Action::Redraw;
+            }
+            ('g', KeyCode::Char('p')) => {
+                app.mode = Mode::GoTo {
+                    input: String::new(),
+                };
                 return Action::Redraw;
             }
             ('c', KeyCode::Char('d')) => {
@@ -271,12 +314,6 @@ fn handle_key(app: &mut App, key: KeyEvent, pending: &mut Option<char>) -> Actio
                         message: format!("{}", e),
                     };
                 }
-                return Action::Redraw;
-            }
-            ('G', KeyCode::Char('p')) => {
-                app.mode = Mode::GoTo {
-                    input: String::new(),
-                };
                 return Action::Redraw;
             }
             _ => {}
@@ -362,9 +399,13 @@ fn handle_key(app: &mut App, key: KeyEvent, pending: &mut Option<char>) -> Actio
         KeyCode::PageDown => app.page_down(),
         KeyCode::PageUp => app.page_up(),
         KeyCode::Home => app.go_top(),
-        KeyCode::End => app.go_bottom(),
+        KeyCode::End | KeyCode::Char('G') => app.go_bottom(),
+        KeyCode::Char(':') => {
+            app.mode = Mode::GoTo {
+                input: String::new(),
+            };
+        }
         KeyCode::Char('g') => *pending = Some('g'),
-        KeyCode::Char('G') => *pending = Some('G'),
         KeyCode::Char('c') => *pending = Some('c'),
         KeyCode::Char(' ') => app.toggle_current(),
         KeyCode::Right | KeyCode::Char('l') => {

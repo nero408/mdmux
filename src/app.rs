@@ -10,6 +10,23 @@ use std::path::{Path, PathBuf};
 use crate::cmux::{CmuxClient, CmuxError, SurfaceId};
 use crate::tree::{NodeKind, Tree, TreeConfig};
 
+/// Upper bound on how many roots we remember for the `b` (back) key. A user
+/// hammering `c d` / `u` shouldn't slowly leak memory; 64 entries is more
+/// history than anyone can usefully reach for.
+const HISTORY_CAP: usize = 64;
+
+/// Upper bound on the file size we slurp for the in-process demo preview pane.
+/// Demo mode is for quick screenshots/gifs, so capping at 1 MiB keeps a typo
+/// (`mdmux --demo /` then pressing Enter on a giant log file) from OOM-ing
+/// the process. Real use delegates rendering to cmux, which has its own
+/// streaming strategy.
+const DEMO_PREVIEW_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Upper bound on the number of lines we keep for the demo preview pane.
+/// Defends against pathologically long lines or files with millions of lines
+/// (the preview pane only shows a few dozen anyway).
+const DEMO_PREVIEW_MAX_LINES: usize = 5_000;
+
 /// Top-level UI mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
@@ -113,10 +130,25 @@ impl App {
     }
 
     /// Switch to a new root directory. Pushes the old root onto history.
+    ///
+    /// `new_root` must resolve to a directory. Pointing at a regular file
+    /// works by accident in [`Tree::build`] (the walker just yields the file
+    /// itself) and produces a confusing one-row tree, so reject it up front.
     pub fn change_root(&mut self, new_root: PathBuf) -> anyhow::Result<()> {
+        let meta = std::fs::metadata(&new_root)
+            .map_err(|e| anyhow::anyhow!("{}: {}", new_root.display(), e))?;
+        if !meta.is_dir() {
+            anyhow::bail!("not a directory: {}", new_root.display());
+        }
         let prev_root = self.tree.root().to_path_buf();
         let tree = Tree::build(&new_root, &self.config)?;
         self.history.push(prev_root);
+        // Bound history so a long session of `cd`/`u` doesn't slowly grow
+        // memory forever. Drop the oldest entry when we overflow.
+        if self.history.len() > HISTORY_CAP {
+            let drop_count = self.history.len() - HISTORY_CAP;
+            self.history.drain(0..drop_count);
+        }
         self.tree = tree;
         self.selection = 0;
         self.viewport_offset = 0;
@@ -313,12 +345,11 @@ impl App {
         self.last_opened = Some(row.path.clone());
         if self.demo_mode {
             // Best-effort: if the file can't be read we just leave the prior
-            // preview in place rather than failing the open.
-            if let Ok(content) = std::fs::read_to_string(&row.path) {
-                self.demo_preview = Some(DemoPreview {
-                    path: row.path.clone(),
-                    lines: content.lines().map(str::to_string).collect(),
-                });
+            // preview in place rather than failing the open. Reads are capped
+            // so pointing the demo at a giant file (accidentally or
+            // intentionally) doesn't OOM us.
+            if let Some(preview) = load_demo_preview(&row.path) {
+                self.demo_preview = Some(preview);
             }
         }
         self.status = format!("→ {}", row.path.display());
@@ -363,6 +394,31 @@ impl App {
         self.tree.set_filter("");
         self.clamp_selection();
     }
+}
+
+/// Read a file for the demo preview pane, returning `None` if the file is
+/// unreadable. The read is capped at [`DEMO_PREVIEW_MAX_BYTES`] and the line
+/// count at [`DEMO_PREVIEW_MAX_LINES`] so pointing the demo at a giant log,
+/// a binary, or a pathologically long line can't OOM the process.
+fn load_demo_preview(path: &Path) -> Option<DemoPreview> {
+    use std::io::Read;
+    let f = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::new();
+    // `take(N)` caps the read so we never allocate more than N bytes.
+    f.take(DEMO_PREVIEW_MAX_BYTES).read_to_end(&mut buf).ok()?;
+    let s = String::from_utf8_lossy(&buf);
+    let mut lines: Vec<String> = s
+        .lines()
+        .take(DEMO_PREVIEW_MAX_LINES)
+        .map(String::from)
+        .collect();
+    if lines.len() == DEMO_PREVIEW_MAX_LINES {
+        lines.push("…(preview truncated)".to_string());
+    }
+    Some(DemoPreview {
+        path: path.to_path_buf(),
+        lines,
+    })
 }
 
 #[cfg(test)]
@@ -501,5 +557,58 @@ mod tests {
         assert_eq!(kind, NodeKind::Dir);
         app.open_selected().unwrap();
         assert!(app.current_md_surface.is_none());
+    }
+
+    #[test]
+    fn change_root_rejects_non_directory() {
+        let r = temp("change_root_file");
+        let file = r.join("a.md");
+        touch(&file);
+        let mock = MockCmux::new();
+        let mut app = App::new(r, Box::new(mock)).unwrap();
+        let err = app.change_root(file).err();
+        assert!(err.is_some(), "expected error for file path");
+    }
+
+    /// `HISTORY_CAP` keeps the back stack from growing forever even if the
+    /// user mashes `c d` / `u` all day.
+    #[test]
+    fn change_root_history_is_capped() {
+        let parent = temp("hist_cap");
+        let mut roots = Vec::new();
+        for i in 0..(HISTORY_CAP + 10) {
+            let p = parent.join(format!("d{i}"));
+            touch(&p.join("inside.md"));
+            roots.push(p);
+        }
+        let mock = MockCmux::new();
+        let mut app = App::new(roots[0].clone(), Box::new(mock)).unwrap();
+        for r in roots.iter().skip(1) {
+            app.change_root(r.clone()).unwrap();
+        }
+        assert!(
+            app.history.len() <= HISTORY_CAP,
+            "history grew to {}",
+            app.history.len()
+        );
+    }
+
+    #[test]
+    fn load_demo_preview_caps_large_files() {
+        let r = temp("demo_cap");
+        let big = r.join("huge.md");
+        fs::create_dir_all(big.parent().unwrap()).unwrap();
+        // Write 2 MiB of `a`'s — twice the preview cap.
+        let content = "a".repeat((DEMO_PREVIEW_MAX_BYTES * 2) as usize);
+        fs::write(&big, content).unwrap();
+        let preview = load_demo_preview(&big).unwrap();
+        // Only the capped slice ends up in memory.
+        let total_bytes: usize = preview.lines.iter().map(|l| l.len()).sum();
+        assert!(
+            (total_bytes as u64) <= DEMO_PREVIEW_MAX_BYTES,
+            "loaded {} bytes (cap is {})",
+            total_bytes,
+            DEMO_PREVIEW_MAX_BYTES
+        );
     }
 }
