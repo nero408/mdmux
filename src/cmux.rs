@@ -10,9 +10,18 @@
 //! All side-effecting operations go through a [`CmuxClient`] trait so the app
 //! state machine can be tested with a mock client.
 
-use std::process::Command;
+use std::io::Read;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
 
 use thiserror::Error;
+
+/// Hard wall-clock cap on any single `cmux` subprocess call. cmux is a local
+/// daemon and should respond essentially instantly — if it takes longer than
+/// this, something is wrong (daemon stuck, socket starved, hung child). We
+/// kill the child and surface a clear error rather than freezing the TUI.
+const CMUX_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Error)]
 pub enum CmuxError {
@@ -24,6 +33,8 @@ pub enum CmuxError {
     CommandFailed(String),
     #[error("could not parse cmux output: {0}")]
     ParseError(String),
+    #[error("cmux command timed out after {0:?}")]
+    Timeout(Duration),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -75,19 +86,17 @@ impl CliCmux {
 
 impl CmuxClient for CliCmux {
     fn is_available(&self) -> bool {
-        Command::new(self.bin())
-            .arg("ping")
-            .output()
+        let mut cmd = Command::new(self.bin());
+        cmd.arg("ping");
+        run_with_timeout(cmd, CMUX_TIMEOUT)
             .map(|o| o.status.success())
             .unwrap_or(false)
     }
 
     fn open_markdown(&self, path: &std::path::Path) -> Result<OpenResult, CmuxError> {
-        let out = Command::new(self.bin())
-            .arg("markdown")
-            .arg("open")
-            .arg(path)
-            .output()?;
+        let mut cmd = Command::new(self.bin());
+        cmd.arg("markdown").arg("open").arg(path);
+        let out = run_with_timeout(cmd, CMUX_TIMEOUT)?;
         if !out.status.success() {
             return Err(CmuxError::CommandFailed(
                 String::from_utf8_lossy(&out.stderr).into_owned(),
@@ -98,11 +107,11 @@ impl CmuxClient for CliCmux {
     }
 
     fn close_surface(&self, surface: &SurfaceId) -> Result<(), CmuxError> {
-        let out = Command::new(self.bin())
-            .arg("close-surface")
+        let mut cmd = Command::new(self.bin());
+        cmd.arg("close-surface")
             .arg("--surface")
-            .arg(surface.as_arg())
-            .output()?;
+            .arg(surface.as_arg());
+        let out = run_with_timeout(cmd, CMUX_TIMEOUT)?;
         if !out.status.success() {
             return Err(CmuxError::CommandFailed(
                 String::from_utf8_lossy(&out.stderr).into_owned(),
@@ -112,42 +121,122 @@ impl CmuxClient for CliCmux {
     }
 }
 
+/// Spawn `cmd` and wait at most `timeout` for it to finish. If the child
+/// outruns the budget we kill it and return [`CmuxError::Timeout`].
+///
+/// Background: a hung `cmux` daemon used to freeze the entire TUI because
+/// `Command::output()` blocks until the child exits. With this wrapper the
+/// worst case is a 5-second wait followed by a clean error overlay.
+///
+/// Implementation: stdout/stderr are drained on worker threads so we can't
+/// deadlock on a full pipe buffer; the main thread polls `try_wait` with a
+/// short sleep and kills the child if the deadline passes.
+fn run_with_timeout(
+    mut cmd: Command,
+    timeout: Duration,
+) -> Result<std::process::Output, CmuxError> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout_reader = stdout.map(|mut s| {
+        thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = s.read_to_end(&mut buf);
+            buf
+        })
+    });
+    let stderr_reader = stderr.map(|mut s| {
+        thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = s.read_to_end(&mut buf);
+            buf
+        })
+    });
+
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break status,
+            None => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    // Don't bother joining the readers — pipes are closed
+                    // now that the child is dead, so they'll return shortly.
+                    return Err(CmuxError::Timeout(timeout));
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+        }
+    };
+
+    let so = stdout_reader
+        .map(|h| h.join().unwrap_or_default())
+        .unwrap_or_default();
+    let se = stderr_reader
+        .map(|h| h.join().unwrap_or_default())
+        .unwrap_or_default();
+    Ok(std::process::Output {
+        status,
+        stdout: so,
+        stderr: se,
+    })
+}
+
 /// Parse a line of the form:
 ///   `OK surface=surface:429 pane=pane:366 path=/some/file.md`
-/// Whitespace-separated key=value pairs after the leading "OK".
+///
+/// `path=` is parsed positionally — its value runs to the end of the line —
+/// because filenames legitimately contain spaces. The earlier `surface=` and
+/// `pane=` values are taken from their declared offsets, not by scanning the
+/// whole line for `key=`, so a path that itself contains `surface=` can no
+/// longer hijack the surface id.
 pub fn parse_open_output(s: &str) -> Result<OpenResult, CmuxError> {
     let line = s
         .lines()
         .find(|l| l.trim_start().starts_with("OK"))
         .ok_or_else(|| CmuxError::ParseError(format!("no OK line in cmux output: {}", s.trim())))?;
-    let mut surface: Option<String> = None;
-    let mut pane: Option<String> = None;
-    let mut path: Option<String> = None;
-    for tok in line.split_whitespace().skip(1) {
-        if let Some(v) = tok.strip_prefix("surface=") {
-            surface = Some(v.to_string());
-        } else if let Some(v) = tok.strip_prefix("pane=") {
-            pane = Some(v.to_string());
-        } else if let Some(v) = tok.strip_prefix("path=") {
-            path = Some(v.to_string());
-        }
-    }
-    // `path=` may legitimately contain spaces; recover by re-splitting once we
-    // know the prefix is found.
-    if path.is_some()
-        && let Some(idx) = line.find("path=")
-    {
-        path = Some(line[idx + "path=".len()..].to_string());
-    }
-    let surface = surface
-        .ok_or_else(|| CmuxError::ParseError(format!("missing surface=... in line: {}", line)))?;
-    let pane = pane.unwrap_or_default();
-    let path = path.unwrap_or_default();
+
+    // surface= must be present.
+    let surface_start = line
+        .find(" surface=")
+        .ok_or_else(|| CmuxError::ParseError(format!("missing surface=... in line: {}", line)))?
+        + " surface=".len();
+    let after_surface = &line[surface_start..];
+    // surface value runs until the next known key (pane= or path=) or EOL.
+    let surface_end = first_of(after_surface, &[" pane=", " path="]).unwrap_or(after_surface.len());
+    let surface_val = after_surface[..surface_end].trim().to_string();
+
+    // pane= and path= are optional. Look for them only after surface= so a
+    // literal "pane=" inside the surface value isn't mis-parsed.
+    let tail = &after_surface[surface_end..];
+    let pane_val = if let Some(rest) = tail.strip_prefix(" pane=") {
+        let end = rest.find(" path=").unwrap_or(rest.len());
+        rest[..end].trim().to_string()
+    } else {
+        String::new()
+    };
+    // path= value extends to the end of the line.
+    let path_val = tail
+        .find(" path=")
+        .map(|idx| tail[idx + " path=".len()..].trim_end().to_string())
+        .unwrap_or_default();
+
     Ok(OpenResult {
-        surface: SurfaceId(surface),
-        pane,
-        path,
+        surface: SurfaceId(surface_val),
+        pane: pane_val,
+        path: path_val,
     })
+}
+
+/// Return the byte index of the leftmost occurrence of any of `needles`
+/// within `hay`, or `None` if none matches.
+fn first_of(hay: &str, needles: &[&str]) -> Option<usize> {
+    needles.iter().filter_map(|n| hay.find(n)).min()
 }
 
 /// In-memory mock used by tests and by the `--demo` flag.
@@ -245,5 +334,27 @@ mod tests {
     fn surface_id_as_arg() {
         let id = SurfaceId("surface:42".to_string());
         assert_eq!(id.as_arg(), "surface:42");
+    }
+
+    /// A path that happens to contain the substring `surface=` used to steal
+    /// the surface id from the real one in the same line. After the
+    /// positional rewrite, the first `surface=` wins and a later literal in
+    /// the path is treated as plain text.
+    #[test]
+    fn parse_does_not_let_path_hijack_surface() {
+        let s = "OK surface=surface:7 pane=pane:9 path=/tmp/weird surface=evil/file.md\n";
+        let parsed = parse_open_output(s).unwrap();
+        assert_eq!(parsed.surface.0, "surface:7");
+        assert_eq!(parsed.pane, "pane:9");
+        assert_eq!(parsed.path, "/tmp/weird surface=evil/file.md");
+    }
+
+    #[test]
+    fn parse_missing_pane_is_ok() {
+        let s = "OK surface=surface:1 path=/tmp/a.md\n";
+        let parsed = parse_open_output(s).unwrap();
+        assert_eq!(parsed.surface.0, "surface:1");
+        assert_eq!(parsed.pane, "");
+        assert_eq!(parsed.path, "/tmp/a.md");
     }
 }

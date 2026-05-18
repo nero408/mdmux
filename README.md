@@ -98,7 +98,7 @@ viewer (with rich formatting and live file watching). Selecting another file
 | `u`             | move root up to parent directory                        |
 | `b`             | go back to the previous root (history)                  |
 | `~`             | jump to `$HOME`                                         |
-| `G p`           | open "go to path" prompt                                |
+| `:` / `g p`     | open "go to path" prompt                                |
 | `.`             | toggle hidden files                                     |
 | `i`             | toggle `.gitignore` respect                             |
 | `/`             | live filter (`Esc` clears)                              |
