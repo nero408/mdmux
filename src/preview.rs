@@ -8,9 +8,10 @@
 //! [`Preview`] owns a snapshot of the currently-opened file (raw lines plus a
 //! pre-rendered ratatui [`Text`]) and a scroll offset. [`load`] reads a file
 //! from disk with a size cap and produces a fresh [`Preview`]. The actual
-//! ratatui rendering uses the `tui-markdown` crate so we get headings, lists,
-//! blockquotes, fenced code blocks, and inline emphasis without writing a
-//! markdown parser.
+//! ratatui rendering uses the `ratkit` crate's markdown widget so we get
+//! headings, lists, blockquotes, fenced code blocks (with syntect-based
+//! syntax highlighting), inline emphasis, **and** pipe tables with column
+//! alignment — without writing a markdown parser.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -44,13 +45,15 @@ impl Preview {
     /// Render the markdown to a ratatui `Text`. We re-render on every draw
     /// because the cost is dominated by the file size, not the frame rate,
     /// and the file size is capped.
-    pub fn render(&self) -> Text<'static> {
+    ///
+    /// `max_width` is the inner content width of the preview pane (i.e.
+    /// `area.width` minus the block borders). It's forwarded to ratkit so
+    /// table rendering and full-width backgrounds size to the actual pane
+    /// rather than ratkit's 120-column default. `None` falls back to that
+    /// default — fine for tests, suboptimal for rendering.
+    pub fn render(&self, max_width: Option<usize>) -> Text<'static> {
         let joined = self.lines.join("\n");
-        // `tui_markdown::from_str` returns `Text<'_>` borrowed from the
-        // input. `Text` has no public `into_owned`, but we can rebuild it
-        // by deep-cloning each span's `Cow<str>` into an owned `String`.
-        let borrowed = tui_markdown::from_str(&joined);
-        to_owned_text(borrowed)
+        ratkit::widgets::markdown_preview::render_markdown(&joined, max_width)
     }
 }
 
@@ -78,40 +81,6 @@ pub fn load(path: &Path) -> Option<Preview> {
         lines,
         truncated,
     })
-}
-
-/// Deep-clone a borrowed `Text` into a `Text<'static>` so we can hand it to
-/// a renderer that outlives the source string.
-///
-/// `ratatui::text::Text` doesn't expose `into_owned`, but its public fields
-/// do — every `Span` is a `Cow<str>` we can replace with an owned `String`.
-fn to_owned_text(t: Text<'_>) -> Text<'static> {
-    use ratatui::text::{Line, Span};
-    use std::borrow::Cow;
-    let lines = t
-        .lines
-        .into_iter()
-        .map(|line| {
-            let spans = line
-                .spans
-                .into_iter()
-                .map(|s| Span {
-                    content: Cow::Owned(s.content.into_owned()),
-                    style: s.style,
-                })
-                .collect();
-            Line {
-                spans,
-                alignment: line.alignment,
-                style: line.style,
-            }
-        })
-        .collect();
-    Text {
-        lines,
-        alignment: t.alignment,
-        style: t.style,
-    }
 }
 
 #[cfg(test)]
@@ -164,9 +133,9 @@ mod tests {
             lines: vec!["# title".into(), "".into(), "**bold** text".into()],
             truncated: false,
         };
-        // The whole point of `to_owned_text` is that the result outlives
-        // the source string — compile-checking this in isolation is enough.
-        let text: Text<'static> = preview.render();
+        // ratkit::render_markdown returns `Text<'static>` directly; this
+        // assignment is the compile-time proof.
+        let text: Text<'static> = preview.render(None);
         assert!(!text.lines.is_empty());
     }
 
@@ -177,8 +146,43 @@ mod tests {
             lines: vec![],
             truncated: false,
         };
-        let text = preview.render();
+        let text = preview.render(None);
         // Empty markdown → empty text. Should not panic.
         let _ = text.lines.len();
+    }
+
+    /// Regression guard: the in-process preview must render markdown tables.
+    /// Switching off `tui-markdown` (which never supported tables) onto
+    /// `ratkit` was the whole point of this renderer — pin the contract so a
+    /// future swap can't silently drop the feature again.
+    #[test]
+    fn render_includes_table_cell_content() {
+        let preview = Preview {
+            path: PathBuf::from("table.md"),
+            lines: vec![
+                "| Col A | Col B |".into(),
+                "|-------|-------|".into(),
+                "| cell-alpha | cell-beta |".into(),
+            ],
+            truncated: false,
+        };
+        let text = preview.render(Some(80));
+
+        // Flatten every span on every line into one string. We don't care
+        // about the exact layout (borders, padding) — just that the cell
+        // contents survive the renderer instead of being dropped on the
+        // floor the way tui-markdown silently did.
+        let flat: String = text
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+
+        for needle in ["Col A", "Col B", "cell-alpha", "cell-beta"] {
+            assert!(
+                flat.contains(needle),
+                "rendered table missing {needle:?}; full text = {flat:?}",
+            );
+        }
     }
 }
