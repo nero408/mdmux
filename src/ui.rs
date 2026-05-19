@@ -516,7 +516,13 @@ fn draw_preview(f: &mut Frame, preview: &Preview, area: Rect, scroll: u16) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Line::from(title_spans));
-    let text = preview.render();
+    // Inner width = pane width minus the two border columns. ratkit uses
+    // this to lay out tables and full-width backgrounds — a wrong value
+    // here means tables either wrap mid-cell or float in dead space.
+    // Saturating-sub guards against a 0/1-wide pane (e.g. ultra-narrow
+    // terminals during resize).
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let text = preview.render(Some(inner_width));
     let para = Paragraph::new(text)
         .block(block)
         .wrap(Wrap { trim: false })

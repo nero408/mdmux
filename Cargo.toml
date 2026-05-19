@@ -27,11 +27,21 @@ clap = { version = "4.5", features = ["derive", "env"] }
 anyhow = "1.0"
 thiserror = "2.0"
 dirs = "5.0"
-# Used to render markdown into ratatui `Text` for the in-process preview
-# pane (the fallback when cmux isn't running). Pinned to =0.3.6 because
-# 0.3.7+ bumps to the ratatui 0.30 workspace (different ratatui-core),
-# which is incompatible with our ratatui 0.29.
-tui-markdown = "=0.3.6"
+# Renders markdown into ratatui `Text` for the in-process preview pane
+# (the fallback when cmux isn't running). Picked over `tui-markdown`
+# because it ships table rendering (header rows, column alignment,
+# borders), syntect-backed code highlighting, and TOC/scroll plumbing
+# while staying on the ratatui 0.29 line we use. Pinned to =0.2.16 to
+# match `tui-markdown`'s previous pinning discipline — the crate is
+# still pre-1.0 and breaks within minor versions are explicitly
+# allowed.
+#
+# Only the `markdown-preview` feature is enabled. That keeps us off the
+# wider ratkit surface (toasts, dialogs, file-system tree, AI chat,
+# etc.) but does pull syntect + pulldown-cmark + arboard transitively;
+# the latter brings X11/Wayland clipboard deps on Linux and is the
+# dominant size cost of the swap.
+ratkit = { version = "=0.2.16", default-features = false, features = ["markdown-preview"] }
 # Cross-platform filesystem watcher. Powers live-reload in the in-process
 # preview pane — when the open file changes on disk, we re-read and
 # re-render. Pinned to the 8.x stable line; 9.x is a release candidate.

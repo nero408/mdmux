@@ -91,9 +91,11 @@ another file **replaces** the panel — no stacked tabs.
 If cmux isn't running (or you pass `--no-cmux`), mdmux automatically
 falls back to rendering the markdown pane itself. The TUI splits
 horizontally: file tree on the left, rendered markdown on the right.
-The preview is powered by [tui-markdown](https://crates.io/crates/tui-markdown)
-(headings, lists, blockquotes, fenced code blocks with syntax highlighting,
-emphasis), with live reload via [notify](https://crates.io/crates/notify).
+The preview is powered by [ratkit](https://crates.io/crates/ratkit)'s
+markdown widget (headings, lists, blockquotes, fenced code blocks with
+[syntect](https://github.com/trishume/syntect)-based syntax highlighting,
+emphasis, **and pipe tables** with column alignment), with live reload
+via [notify](https://crates.io/crates/notify).
 
 ## Keys
 
@@ -151,8 +153,9 @@ rendering the panel itself:
 
 1. The TUI grows a second pane on the right (40/60 split).
 2. On `Enter`, the file is loaded (capped at 1 MiB) and rendered via
-   [tui-markdown](https://crates.io/crates/tui-markdown). Headings,
-   lists, blockquotes, fenced code blocks with syntax highlighting via
+   [ratkit](https://crates.io/crates/ratkit)'s markdown widget. Headings,
+   lists, blockquotes, pipe tables (with header rows and column
+   alignment), fenced code blocks with syntax highlighting via
    [syntect](https://github.com/trishume/syntect), and inline emphasis
    all work.
 3. A [notify](https://crates.io/crates/notify) watcher tracks the open
@@ -173,7 +176,7 @@ src/
 ├── app.rs      — state machine (tree + selection + render mode + preview)
 ├── tree.rs     — directory walker + tree model + filter
 ├── cmux.rs     — cmux CLI wrapper (CmuxClient trait + mock + timeout)
-├── preview.rs  — in-process preview loader + tui-markdown render
+├── preview.rs  — in-process preview loader + ratkit render
 ├── watcher.rs  — notify-based live-reload for in-process mode
 └── ui.rs       — ratatui rendering
 ```
