@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Entries are generated from [conventional commits](https://www.conventionalcommits.org)
 by [git-cliff](https://git-cliff.org).
 
+## [0.3.0](https://github.com/nero408/mdmux/commit/v0.3.0) - 2026-05-20
+
+### Features
+
+- Swap tui-markdown for ratkit to gain table rendering (#5) ([acd43d5](https://github.com/nero408/mdmux/commit/acd43d57ec47876d3e59ff14dfa9f8e4ef2c6da3))
 ## [0.2.0](https://github.com/nero408/mdmux/commit/v0.2.0) - 2026-05-18
 
 ### Bug Fixes
